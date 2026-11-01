@@ -1,0 +1,2246 @@
+import pygame
+import sys
+import math
+import random
+import json
+import os
+
+pygame.init()
+
+WIDTH, HEIGHT = 1300, 700
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Push Ball Touch")
+
+BLACK       = (10, 10, 15)
+WHITE       = (255, 255, 255)
+YELLOW      = (255, 220, 80)
+YELLOW_DARK = (200, 140, 0)
+GREEN       = (0, 255, 100)
+RED         = (255, 60, 60)
+CYAN        = (0, 220, 255)
+PURPLE      = (180, 80, 255)
+ORANGE      = (255, 140, 0)
+GRAY_LIGHT  = (220, 220, 220)
+GRAY_MID    = (150, 150, 150)
+GRAY_DARK   = (80, 80, 80)
+WIND_COLOR  = (180, 220, 255)
+GATE_CLOSED = (220, 80, 0)
+GATE_OPEN_C = (0, 200, 80)
+BTN_OFF     = (180, 50, 50)
+BTN_ON      = (60, 255, 120)
+
+clock = pygame.time.Clock()
+
+SAVE_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pushball_save.json")
+DEFAULT_SLOTS = 4
+
+def load_all_slots():
+    try:
+        with open(SAVE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("slots", [])
+        slots = []
+        for e in raw:
+            if e:
+                slots.append({"level": int(e.get("level", 0)), "unlocked": int(e.get("unlocked", 0))})
+            else:
+                slots.append(None)
+        if not slots:
+            slots = [None] * DEFAULT_SLOTS
+        return slots
+    except Exception:
+        return [None] * DEFAULT_SLOTS
+
+def write_all_slots(slots):
+    try:
+        with open(SAVE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"slots": slots}, f)
+    except Exception:
+        pass
+
+def save_slot(slot_idx, level, unlocked):
+    if slot_idx is None:
+        return
+    slots = load_all_slots()
+    while slot_idx >= len(slots):
+        slots.append(None)
+    prev = slots[slot_idx]
+    best_unlocked = max(unlocked, prev["unlocked"] if prev else 0)
+    slots[slot_idx] = {"level": level, "unlocked": best_unlocked}
+    write_all_slots(slots)
+
+def reset_slot(slot_idx):
+    slots = load_all_slots()
+    if 0 <= slot_idx < len(slots):
+        slots[slot_idx] = None
+        write_all_slots(slots)
+
+def add_slot():
+    slots = load_all_slots()
+    slots.append(None)
+    write_all_slots(slots)
+    return len(slots) - 1
+
+def remove_slot(slot_idx):
+    slots = load_all_slots()
+    if len(slots) <= 1:
+        return
+    if 0 <= slot_idx < len(slots):
+        del slots[slot_idx]
+        write_all_slots(slots)
+
+
+REF_ARENA       = pygame.Rect(40, 80, 1220, 560)
+REF_PLAYER_SIZE = 30
+REF_BALL_RADIUS = 18
+REF_GOAL_W      = 60
+REF_GOAL_H      = 60
+
+ARENA       = REF_ARENA.copy()
+PLAYER_SIZE = REF_PLAYER_SIZE
+BALL_RADIUS = REF_BALL_RADIUS
+GOAL_W      = REF_GOAL_W
+GOAL_H      = REF_GOAL_H
+PLAYER_SPEED= 7
+BOUNCE      = 0.92
+GAP         = 100
+
+font_big   = pygame.font.SysFont("monospace", 52, bold=True)
+font_med   = pygame.font.SysFont("monospace", 20)
+font_small = pygame.font.SysFont("monospace", 13)
+font_hud   = pygame.font.SysFont("monospace", 16, bold=True)
+
+hole_surface_cache = {}
+text_cache = {}
+
+def render_text(font, text, color):
+    k = (id(font), text, color)
+    if k not in text_cache:
+        text_cache[k] = font.render(text, True, color)
+    return text_cache[k]
+
+def clamp(val, mn, mx): return max(mn, min(mx, val))
+
+def rect_circle_collide(rx,ry,rw,rh,cx,cy,cr):
+    nx=clamp(cx,rx,rx+rw); ny=clamp(cy,ry,ry+rh)
+    dx,dy=cx-nx,cy-ny
+    return dx*dx+dy*dy<cr*cr
+
+def resolve_rect_circle(rx,ry,rw,rh,cx,cy,cr):
+    nx=clamp(cx,rx,rx+rw); ny=clamp(cy,ry,ry+rh)
+    dx,dy=cx-nx,cy-ny
+    dist=math.sqrt(dx*dx+dy*dy)
+    if dist==0: return 0,-1,cr
+    return dx/dist,dy/dist,cr-dist
+
+def resolve_ball_against_blockers(ball_pos, ball_vel, blockers, passes=4):
+    for _ in range(passes):
+        hit_any=False
+        for r in blockers:
+            if rect_circle_collide(r.x,r.y,r.w,r.h,ball_pos[0],ball_pos[1],BALL_RADIUS):
+                hit_any=True
+                nx,ny,overlap=resolve_rect_circle(r.x,r.y,r.w,r.h,ball_pos[0],ball_pos[1],BALL_RADIUS)
+                ball_pos[0]+=nx*(overlap+0.5); ball_pos[1]+=ny*(overlap+0.5)
+                dot=ball_vel[0]*nx+ball_vel[1]*ny
+                if dot<0:
+                    ball_vel[0]=(ball_vel[0]-2*dot*nx)*BOUNCE
+                    ball_vel[1]=(ball_vel[1]-2*dot*ny)*BOUNCE
+        if not hit_any:
+            break
+
+def W(x,y,w,h):        return pygame.Rect(x,y,w,h)
+def MZ(x,y,w,h,force): return {"rect":W(x,y,w,h),"force":force}
+def HOLE(x,y,w=70,h=70): return W(x,y,w,h)
+def WIND(dx,dy,st):    return {"dx":dx,"dy":dy,"strength":st}
+
+def KEY(x,y): return {"rect":W(x,y,28,28),"collected":False,"orig_x":x,"orig_y":y}
+
+def PORTAL(ax,ay,bx,by,s=44,vax=2.6,vay=1.3,vbx=-1.3,vby=2.6):
+    return {
+        "a":W(ax,ay,s,s), "b":W(bx,by,s,s),
+        "va":[float(vax),float(vay)],
+        "vb":[float(vbx),float(vby)],
+        "cooldown":0,"player_cooldown":0
+    }
+
+def GATE_V(x, thickness=18):
+    return {"type":"V","x":x,"y":REF_ARENA.y+2,
+            "length":REF_ARENA.h-4,"thickness":thickness,
+            "rect":pygame.Rect(x,REF_ARENA.y+2,thickness,REF_ARENA.h-4),
+            "open":False}
+
+def GATE_H(y, thickness=18):
+    return {"type":"H","x":REF_ARENA.x+2,"y":y,
+            "length":REF_ARENA.w-4,"thickness":thickness,
+            "rect":pygame.Rect(REF_ARENA.x+2,y,REF_ARENA.w-4,thickness),
+            "open":False}
+
+def BTN(x,y,gate_index):
+    return {"rect":W(x,y,34,34),"gate_index":gate_index,"active":False}
+
+def make_level(name,info,player_start,ball_start,goal_pos,
+               walls=None,holes=None,magnet_zones=None,
+               portals=None,winds=None,keys=None,
+               gates=None,buttons=None,friction=0.91):
+
+    return {
+        "name":name,"info":info,
+        "player_start":player_start,"ball_start":ball_start,"goal_pos":goal_pos,
+        "walls":walls or [],"holes":holes or [],
+        "magnet_zones":magnet_zones or [],
+        "portals":portals or [],
+        "winds":winds or [],
+        "keys":keys or [],
+        "gates":gates or [],
+        "buttons":buttons or [],
+        "friction":friction,
+    }
+
+def make_levels():
+    X,Y,W2,H = REF_ARENA.x,REF_ARENA.y,REF_ARENA.w,REF_ARENA.h
+    MX,MY    = X+W2//2, Y+H//2
+
+    return [
+
+        make_level("Level 1 — Dorongan Pertama","Dorong bola ke goal!",
+            (X+60,MY-15),(X+160,MY),(X+640,MY-240)),
+        make_level("Level 2 — Target Jauh","Goal ada di ujung arena!",
+            (X+60,MY-15),(X+200,MY),(X+W2-GOAL_W-320,MY+170)),
+        make_level("Level 3 — Celah Sempit", "Cari celah di dinding!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-210, MY-240),
+            walls=[
+
+                W(X+250, Y+10, 20, H//2-60), 
+                W(X+250, MY+30, 20, H//2-60),
+                
+                W(X+550, Y+10, 20, H//2-90), 
+                W(X+550, MY+30, 20, H//2-90),
+                
+                W(X+850, Y+10, 20, H//2-60), 
+                W(X+850, MY+30, 20, H//2-60)
+            ] + [W(730,223,220,20)]),
+        make_level("Level 4 — Jalur Zigzag","Zigzag lewat celah!",
+            (X+60,Y+H-50),(X+180,Y+H-80),(X+W2-GOAL_W-20,Y+20),
+            walls=[
+                W(X+200, Y+10, 20, H-GAP-10),
+                W(X+400, Y+GAP, 20, H-GAP-10),
+                W(X+600, Y+10, 20, H-GAP-10),
+                W(X+800, Y+GAP, 20, H-GAP-10),
+                W(X+1000, Y+10, 20, H-GAP-10)
+            ] + [W(350,486,120,20)]),
+        make_level("Level 5 — Tarikan Magnet","Tiga zona magnet menarik bola! Hati-hati.",
+            (X+60,MY-15),(X+200,MY),(X+W2-GOAL_W-20,MY+150),
+            magnet_zones=[MZ(MX-150,Y+30,460,100,3.12),
+                          MZ(X-490,MY-90,600,180,2.5),
+                          MZ(MX+100,Y+H-110,420,90,2.75)],
+            walls=[W(860,88,20,111), W(860,249,20,393), W(48,290,306,20), W(754,290,220,20)]),
+        make_level("Level 6 — Gaya Berlawanan","Empat magnet, tarik dan tolak silih berganti!",
+            (X+60,MY-15),(X+200,MY),(X+W2-GOAL_W-640,Y+H-GOAL_H-300),
+            magnet_zones=[MZ(MX-180,Y+30,300,300,3.5),
+                          MZ(X+700,MY+60,260,300,-2.75),
+                          MZ(X+200,MY-80,180,280,2.5),
+                          MZ(X+W2-280,Y+30,220,290,-2.25)],
+            walls=[W(486,88,20,100), W(486,241,20,391), W(48,246,160,20), W(408,246,444,20)]),
+        make_level("Level 7 — Labirin Magnet", "Dinding dan tiga magnet!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, MY-190),
+            walls=[
+
+                W(X+220, Y+10, 20, 250),
+                W(X+220, Y+380, 20, 250),
+                
+                W(X+450, Y+10, 20, 350),
+                W(X+450, Y+460, 20, 180),
+                
+                W(X+220, Y+250, 100, 20),
+                W(X+360, Y+380, 150, 20),
+                W(X+100, Y+500, 170, 20),
+
+                W(X+680, Y+10, 20, 250),
+                W(X+680, Y+360, 20, 280),
+                W(X+550, Y+250, 150, 20),
+                W(X+680, Y+360, 100, 20),
+
+                W(X+920, Y+10, 20, 400),
+                W(X+920, Y+500, 20, 140),
+                W(X+1050, Y+150, 150, 20),
+                W(X+920, Y+400, 150, 20)
+            ],
+            magnet_zones=[
+                MZ(MX-450, Y+20, 580, 100, 3.12),
+                MZ(X-450, MY-60, 1000, 100, -2.5),
+                MZ(X-900, MY+40, 1020, 90, 2.75)
+            ]),
+        make_level("Level 8 — Angin Pertama","Dua angin sekaligus! Kanan dan bawah.",
+            (X+W2-120,MY-15),(X+W2-260,MY),(X+30,MY-190),
+            winds=[WIND(1.0,0.0,0.182),WIND(0.0,1.0,0.13)],
+            walls=[W(279,88,20,191), W(279,429,20,203), W(48,394,87,20), W(475,394,777,20)]),
+        make_level("Level 9 — Hembusan Kuat","Tiga angin berbeda arah! Kontrol bola dengan hati.",
+            (X+W2-120,Y+H-50),(X+W2-260,Y+H-80),(X+30,Y+120),
+            winds=[WIND(1.0,0.0,0.234),WIND(-1.0,0.0,0.104),WIND(0.0,-1.0,0.13)],
+            walls=[W(853,128,20,343), W(853,561,20,71), W(48,296,208,20), W(476,296,776,20)]),
+        make_level("Level 10 — Jalur Berangin","Dinding + dua angin berlawanan!",
+            (X+W2-120,MY-15),(X+W2-260,MY),(X+210,MY-270),
+            walls=[W(X+900,Y+10,20,H//2-80),W(X+900,MY+160,20,H//2-80),W(X+600,Y+40,20,H-GAP-40)] + [W(192,351,610,20)],
+            winds=[WIND(1.0,0.0,0.195),WIND(0.0,1.0,0.117)]),
+        make_level("Level 11 — Perpaduan Elemen", "Tantangan Zig-Zag Menembus Angin!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, Y+20),
+
+            walls=[
+                W(X+300, Y, 20, H-150),
+                W(X+550, Y+150, 20, H-150),
+                W(X+800, Y, 20, H-150),
+                W(X+1050, Y+150, 20, H-150)
+            ],
+
+            magnet_zones=[
+                MZ(X+300, Y+H-120, 150, 100, 3.0),
+                MZ(X+550, Y+20, 150, 100, -2.5),
+                MZ(X+800, Y+H-120, 150, 100, 2.8),
+                MZ(X+1050, Y+20, 150, 100, -2.2)
+            ],
+
+            winds=[
+                WIND(-1.0, 0.0, 0.104),
+                WIND(-1.0, 0.0, 0.104)
+            ]),
+        make_level("Level 12 — Zona Berbahaya", "Jangan sampai bola masuk lubang!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, MY-30),
+
+            holes=[
+                HOLE(X+400, Y+H-120, 70, 70),
+                HOLE(X+700, Y+50, 70, 70),
+                HOLE(X+1000, Y+H-120, 70, 70)
+            ],
+
+            walls=[
+                W(X+350, Y, 20, H-160),
+                W(X+650, Y+160, 20, H-160),
+                W(X+950, Y, 20, H-160)
+            ]),
+        make_level("Level 13 — Ladang Perangkap", "Navigasi Ekstrem: Lubang dan Dinding Rapat!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, Y+H-GOAL_H-20),
+
+            holes=[
+                HOLE(X+280, Y+H-110, 65, 65),
+                HOLE(X+430, MY-30, 65, 65),
+                HOLE(X+520, Y+45, 65, 65),
+                HOLE(X+670, MY-30, 65, 65),
+                HOLE(X+760, Y+H-110, 65, 65),
+                HOLE(X+910, MY-30, 65, 65),
+                HOLE(X+1000, Y+45, 65, 65)
+            ],
+
+            walls=[
+                W(X+240, Y, 20, H-140),
+                W(X+480, Y+140, 20, H-140),
+                W(X+720, Y, 20, H-140),
+                W(X+960, Y+140, 20, H-140)
+            ]),
+        make_level("Level 14 — Koridor Mematikan", "Navigasi Koridor Sempit dan Banyak Jebakan!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, MY-30),
+
+            walls=[
+
+                W(X+330, MY-80, 200, 20),
+                W(X+750, MY-80, 350, 20),
+                W(X+1050, MY+80, 150, 20),
+                W(X+350, MY+80, 450, 20),
+                
+                W(X+250, Y, 20, MY-80),
+                W(X+600, MY-80, 20, 160),
+                W(X+950, MY+80, 20, H-(MY+80))
+            ],
+
+            holes=[
+
+                HOLE(X+350, Y+40, 60, 60),
+                HOLE(X+550, Y+40, 60, 60),
+                
+                HOLE(X+600, MY-20, 50, 50),
+                HOLE(X+750, MY-20, 50, 50),
+                
+                HOLE(X+450, Y+H-100, 60, 60),
+                HOLE(X+850, Y+H-100, 60, 60),
+                
+                HOLE(X+1050, MY-20, 65, 65)
+            ]),
+        make_level("Level 15 — Kombinasi Mematikan", "Celah Sempit, Tarikan Magnet, dan Lubang!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, Y+H-GOAL_H-20),
+
+            walls=[
+                W(X+300, Y, 20, H-160),
+                W(X+450, Y+H-160, 120, 20),
+                
+                W(X+600, Y+140, 20, H-140),
+                W(X+600, Y+140, 150, 20),
+                
+                W(X+900, Y+150, 20, 260),
+                W(X+900, Y+H-160, 100, 20)
+            ],
+
+            magnet_zones=[
+                MZ(X+350, Y+H-120, 180, 90, 3.8),
+                MZ(X+480, Y+H-120, 150, 90, -3.0),
+                MZ(X+650, Y+30, 180, 90, 3.5),
+                MZ(X+780, Y+30, 150, 90, -2.8),
+                MZ(X+950, MY-40, 180, 80, 3.2)
+            ],
+
+            holes=[
+                HOLE(X+420, Y+H-100, 65, 65),
+                HOLE(X+720, Y+50, 65, 65),
+                HOLE(X+850, Y+H-100, 65, 65),
+                HOLE(X+1050, MY+20, 70, 70)
+            ]),
+        make_level("Level 16 — Bahaya Total", "Klimaks Elemen: Zig-Zag, Magnet, Angin, dan Lubang!",
+            (X+60, Y+20), (X+200, Y+80), (X+W2-GOAL_W-20, Y+H-GOAL_H-20),
+
+            walls=[
+                W(X+220, Y, 20, H-150),
+                W(X+440, Y+150, 20, H-150),
+                W(X+660, Y, 20, H-150),
+                W(X+880, Y+150, 20, H-150),
+                W(X+1100, Y, 20, H-150)
+            ],
+
+            magnet_zones=[
+                MZ(X+220, Y+H-120, 160, 90, 3.5),
+                MZ(X+440, Y+30, 160, 90, -2.8),
+                MZ(X+660, Y+H-120, 160, 90, 3.2),
+                MZ(X+880, Y+30, 160, 90, -2.5),
+                MZ(X+1100, MY-40, 150, 80, 3.0)
+            ],
+
+            winds=[
+                WIND(0.0, 1.0, 0.156),
+                WIND(-1.0, 0.0, 0.12),
+                WIND(1.0, -0.5, 0.08)
+            ],
+
+            holes=[
+                HOLE(X+330, Y+H-100, 70, 70),
+                HOLE(X+550, Y+50, 70, 70),
+                HOLE(X+770, Y+H-100, 70, 70),
+                HOLE(X+990, Y+50, 70, 70)
+            ]),
+
+        make_level("Level 17 — Kunci Pertama","Ambil kunci, lalu dorong bola ke goal!",
+            (X+60,MY-15),(X+200,MY),(X+W2-GOAL_W-20,MY+120),
+            keys=[KEY(MX+364,MY-214)],
+            walls=[W(939,88,20,125), W(939,363,20,269), W(48,253,409,20), W(677,253,575,20)]),
+
+        make_level("Level 18 — Dua Kunci","Ambil SEMUA kunci dulu sebelum goal aktif!",
+            (X+60,MY-15),(X+200,MY),(X+W2-GOAL_W-20,Y+H-GOAL_H-20),
+            keys=[KEY(X+W2-200,Y+30), KEY(MX-14,Y+H-60)],
+            walls=[W(556,88,20,126), W(556,344,20,288), W(48,252,276,20), W(504,252,748,20)]),
+
+        make_level("Level 19 — Tiga Kunci","Tiga kunci tersebar! Ambil semua.",
+            (X+60,MY-15),(X+200,MY),(X+W2-GOAL_W-20,MY-30),
+            walls=[W(X+380,Y+10,20,H//2-80),W(X+380,MY+80,20,150),W(X+760,Y+GAP,20,H-GAP-10)] + [W(48,440,600,20), W(880,440,372,20)],
+            keys=[KEY(X-550,MY+114), KEY(X+200,Y+30), KEY(X+900,Y+H-60)]),
+
+        make_level("Level 20 — Kunci Magnetik", "Ambil 3 Kunci di Sudut Labirin Magnet!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, MY+180),
+
+            walls=[
+                W(X+280, Y, 20, H-140),
+                W(X+560, Y+140, 20, H-140),
+                W(X+840, Y, 20, H-140),
+                W(X+1120, Y+140, 20, H-140)
+            ],
+
+            magnet_zones=[
+                MZ(X+200, Y+H-110, 150, 90, 3.2),
+                MZ(X+350, Y+30, 180, 90, -2.8),
+                MZ(X+560, Y+30, 160, 90, 3.5),
+                MZ(X+840, Y+H-110, 165, 90, -2.5),
+                MZ(X+1120, Y+30, 150, 85, 3.0)
+            ],
+
+            keys=[
+                KEY(X+150, Y+H-70),
+                KEY(X+700, Y+60),
+                KEY(X+150, Y+100)
+            ]),
+
+        make_level("Level 21 — Kunci Berangin", "Badai Magnet dan Angin di Labirin Mundur!",
+            (X+W2-120, MY-15), (X+W2-260, MY), (X+30, MY-30),
+
+            walls=[
+                W(X+1050, Y+130, 20, H-130),
+                W(X+880, Y, 20, H-130),
+                W(X+710, Y+130, 20, H-130),
+                W(X+540, Y, 20, H-130),
+                W(X+370, Y+130, 20, H-130),
+                W(X+200, Y, 20, H-130)
+            ],
+
+            magnet_zones=[
+                MZ(X+1050, Y+20, 150, 90, -3.0),
+                MZ(X+710, Y+20, 150, 90, 3.5),
+                MZ(X+540, Y+H-110, 150, 90, -2.8),
+                MZ(X+200, Y+H-110, 150, 90, 3.2)
+            ],
+
+            winds=[
+                WIND(1.0, 0.0, 0.16),
+                WIND(-1.0, 0.0, 0.12),
+                WIND(0.0, 1.0, 0.10),
+                WIND(0.0, -1.0, 0.08)
+            ],
+
+            keys=[
+                KEY(X+965, Y+H-60),
+                KEY(X+625, Y+40),
+                KEY(X+285, Y+H-60)
+            ]),
+
+        make_level("Level 22 — Kunci Kekacauan", "Labirin Horizontal: Kekacauan Elemen Maksimal!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, Y+H-GOAL_H-20),
+
+            walls=[
+                W(X, Y+130, W2-220, 20),
+                W(X+220, Y+260, W2-220, 20),
+                W(X, Y+390, W2-220, 20)
+            ],
+
+            magnet_zones=[
+                MZ(X+W2-250, Y+40, 200, 80, 3.2),
+                MZ(X+220, Y+170, 200, 80, -2.8),
+                MZ(X+W2-350, Y+300, 250, 80, 3.5),
+                MZ(X+400, Y+430, 200, 80, -2.5),
+                MZ(X+W2-200, MY, 180, 80, 3.0)
+            ],
+
+            winds=[
+                WIND(0.0, 1.0, 0.14),
+                WIND(-1.0, 0.0, 0.11),
+                WIND(1.0, -0.5, 0.08)
+            ],
+
+            holes=[
+                HOLE(X+W2-120, Y+180, 70, 70),
+                HOLE(X+100, Y+310, 70, 70),
+                HOLE(X+600, Y+440, 65, 65)
+            ],
+
+            keys=[
+                KEY(X+W2-120, Y+40),
+                KEY(X+80, Y+170),
+                KEY(X+W2-120, Y+300),
+                KEY(X+300, Y+440)
+            ]),
+
+        make_level("Level 23 — Portal Pertama", "Awas Distorsi Ruang: Navigasi Zig-Zag dan Portal!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, Y+20),
+
+            walls=[
+                W(X+240, Y, 20, H-140),
+                W(X+460, Y+140, 20, H-140),
+                W(X+680, Y, 20, H-140),
+                W(X+900, Y+140, 20, H-140),
+                W(X+1120, Y, 20, H-140)
+            ],
+
+            portals=[
+
+                PORTAL(X+240, Y+H-100, X+100, Y+50, vax=2.6, vay=1.3, vbx=2.6, vby=2.6),
+                
+                PORTAL(X+780, MY-40, X+350, Y+40, vax=2.5, vay=1.5, vbx=2.5, vby=2.0)
+            ]),
+
+        make_level("Level 24 — Portal Ganda","Dua portal bergerak mengacaukan segalanya!",
+            (X+60,MY-15),(X+200,MY),(X+150,MY-150),
+            portals=[PORTAL(X+80,Y+20,X+W2-140,Y+H-80, vax=3.9,vay=1.3,vbx=-2.6,vby=3.9),
+                     PORTAL(X+80,Y+H-80,X+W2-140,Y+20, vax=-2.6,vay=2.6,vbx=2.6,vby=-1.3)],
+            walls=[W(714,88,20,172), W(714,390,20,242), W(48,273,821,20), W(1129,273,123,20)]),
+
+        make_level("Level 25 — Tembus Dinding", "Portal bergerak + labirin dinding terkurung!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, MY+90),
+
+            walls=[
+                W(X+400, Y+10, 20, H-GAP-10), 
+                W(X+800, Y+GAP, 20, H-GAP-10)
+            ] + [
+                W(48, 388, 237, 20), 
+                W(545, 388, 707, 20),
+                W(X+250, Y+100, 150, 20),
+                W(X+250, Y+100, 20, 150),
+                W(X+600, Y+250, 180, 20)
+            ],
+
+            portals=[
+
+                PORTAL(X+80, Y+H-80, X+W2-140, Y+20, vax=2.6, vay=2.6, vbx=3.9, vby=1.3),
+                
+                PORTAL(X+150, MY-15, X+820, Y+350, vax=1.0, vay=1.0, vbx=1.0, vby=1.0),
+                
+                PORTAL(X+280, Y+150, X+500, Y+200, vax=2.0, vay=2.0, vbx=1.0, vby=1.0),
+                
+                PORTAL(X+450, Y+300, X+750, Y+100, vax=1.5, vay=2.5, vbx=2.0, vby=2.0)
+            ]),
+
+        make_level("Level 26 — Portal Magnetik", "Kacau! Badai Magnet + Portal Distorsi",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, Y+H-GOAL_H-20),
+
+            walls=[
+                W(X+380, Y+10, 20, H//2-80),
+                W(X+380, MY+80, 20, H//2-80),
+                W(X+750, Y+GAP, 20, H-GAP-10)
+            ] + [
+                W(48, 289, 580, 20), 
+                W(888, 289, 364, 20),
+                W(X+550, Y+120, 20, 180)
+            ],
+
+            magnet_zones=[
+                MZ(MX-140, Y+30, 280, 200, 3.5),
+                MZ(X+780, MY+60, 250, 100, -2.75),
+                MZ(X+200, MY-60, 200, 185, 2.5),
+                MZ(X+W2-260, Y+30, 200, 85, -2.25),
+                
+                MZ(X+120, MY+50, 150, 80, -4.0), 
+                
+                MZ(X+450, Y+180, 180, 220, 4.5)
+            ],
+
+            portals=[
+
+                PORTAL(X+80, Y+H-80, X+W2-140, Y+20, vax=3.9, vay=2.6, vbx=-2.6, vby=3.9),
+                
+                PORTAL(X+280, MY+100, X+70, MY-100, vax=0, vay=0, vbx=1.0, vby=1.0),
+                
+                PORTAL(X+400, Y+50, X+600, Y+350, vax=-2.0, vay=1.5, vbx=2.5, vby=-1.5),
+                
+                PORTAL(X+W2-GOAL_W-80, Y+H-GOAL_H-30, X+800, Y+50, vax=2.0, vay=2.0, vbx=2.0, vby=2.0)
+            ]),
+
+        make_level("Level 27 — Portal Berangin", "Labirin Zig-Zag: Badai, Magnet & Portal Silang!",
+            (X+60, Y+20), (X+200, Y+80), (X+W2-GOAL_W-20, Y-650),
+            walls=[
+                W(X+280, Y+10, 20, H-120),
+                W(X+480, Y+120, 20, H-10),
+                W(X+680, Y+10, 20, H-150),
+                W(X+880, Y+150, 20, H-10),
+                W(X+1080, Y+10, 20, H-120),
+                W(644, 356, 200, 20),
+                W(X+380, Y+200, 100, 20)
+            ],
+            magnet_zones=[
+                MZ(X+420, MY-70, 300, 110, 3.5),
+                MZ(X+790, Y+20, 260, 110, -2.75),
+                MZ(X+250, MY+50, 200, 85, 2.5),
+                MZ(X+600, Y+H-110, 200, 85, -2.25),
+                MZ(X+280, Y+H-110, 200, 100, 4.0),
+                MZ(X+680, Y+10, 200, 120, -3.5)
+            ],
+            winds=[
+                WIND(0.0, 1.0, 0.22),
+                WIND(1.0, 0.0, 0.15),
+                WIND(-0.5, -0.5, 0.12)
+            ],
+            portals=[
+                PORTAL(X+80, Y+H-80, X+W2-140, Y+20, vax=3.5, vay=4.2, vbx=-4.2, vby=3.5),
+                PORTAL(X+220, Y+H-60, X+60, Y+40, vax=0, vay=0, vbx=0, vby=0),
+                PORTAL(X+580, Y+50, X+780, Y+H-150, vax=0, vay=3.0, vbx=0, vby=-3.0),
+                PORTAL(X+W2-100, Y+H-200, X+480, Y+40, vax=0, vay=0, vbx=0, vby=0)
+            ]),
+
+        make_level("Level 28 — Kekacauan Besar", "Labirin Zig-Zag: Total Chaos!",
+            (X+60, MY-15), (X+200, MY), (X+W2-GOAL_W-20, Y+H-GOAL_H-20),
+
+            walls=[
+                W(X+220, Y+10, 20, H-140),
+                W(X+400, Y+120, 20, H-10),
+                W(X+580, Y+10, 20, H-150),
+                W(X+760, Y+150, 20, H-10),
+                W(X+940, Y+10, 20, H-140),
+                W(X+1120, Y+130, 20, H-10),
+
+                W(48, 421, 898, 20), 
+                W(1226, 421, 36, 20),
+                W(X+300, Y+220, 100, 20),
+                W(X+660, Y+300, 100, 20),
+                W(X+1020, Y+120, 100, 20)
+            ],
+
+            magnet_zones=[
+                MZ(X+400, Y+20, 280, 100, 3.12),
+                MZ(X+750, MY+60, 260, 100, -2.5),
+                MZ(X+200, MY-60, 200, 85, 2.75),
+                MZ(X+600, Y+H-110, 200, 85, -2.25),
+                MZ(X+W2-250, MY+50, 180, 80, 2.5),
+
+                MZ(X+220, Y+10, 180, 100, 4.2),
+
+                MZ(X+760, Y+150, 180, 110, -4.5)
+            ],
+
+            winds=[
+                WIND(0.0, 1.0, 0.22),
+                WIND(1.0, 0.0, 0.15),
+                WIND(-1.0, 0.0, 0.12),
+                WIND(0.0, -1.0, 0.18)
+            ],
+
+            holes=[
+                HOLE(MX-40, Y+10, 80, 80),
+                HOLE(X+550, Y+H-90, 80, 80),
+                HOLE(X+300, Y+H-90, 90, 90),
+                HOLE(X+840, Y+20, 80, 80)
+            ],
+
+            portals=[
+
+                PORTAL(X+80, Y+H-80, X+W2-140, Y+20, vax=0.9, vay=1.3, vbx=-2.6, vby=0.9),
+                
+                PORTAL(X+160, Y+H-60, X+50, Y+50, vax=0, vay=0, vbx=0, vby=0),
+                
+                PORTAL(X+490, Y+40, X+670, Y+H-140, vax=0, vay=4.0, vbx=0, vby=-4.0),
+                
+                PORTAL(X+710, Y+H-70, X+250, Y+150, vax=0, vay=0, vbx=0, vby=0),
+                
+                PORTAL(X+850, Y+40, X+1050, Y+H-100, vax=3.5, vay=0, vbx=-3.5, vby=0),
+                
+                PORTAL(X+W2-GOAL_W-80, Y+H-GOAL_H-30, X+450, Y+200, vax=0, vay=0, vbx=0, vby=0)
+            ]),
+
+        make_level("Level 29 — Kekacauan Puncak","Semua mekanik! 3 kunci + 2 portal bergerak.",
+            (X+60,MY-15),(X+200,MY),(X+W2-GOAL_W-20,Y+H-GOAL_H-20),
+            walls=[W(X+320,Y+10,20,H//2-80),W(X+320,MY-20,20,100),
+                   W(X+640,Y+GAP,20,H-GAP-10),W(X+960,Y+10,20,H//2-80),W(X+960,MY+80,20,H//2-80)] + [W(48,451,832,20), W(1140,451,112,20)],
+            magnet_zones=[MZ(X+360,Y+20,260,100,3.5),MZ(X+680,MY+60,260,100,-3.12),
+                          MZ(X+1000,Y+20,200,100,2.75),MZ(X+200,MY-60,200,85,2.5),
+                          MZ(X+500,Y+H-110,200,85,-2.25),MZ(X+W2-250,MY+50,180,80,2.88)],
+            winds=[WIND(1.0,0.0,0.182),WIND(0.0,1.0,0.117),WIND(-1.0,0.0,0.091)],
+            holes=[HOLE(MX-40,Y+10,80,80),HOLE(X+500,Y+H-90,80,80),HOLE(X+820,Y+10,80,80)],
+            keys=[KEY(X+W2-200,MY-14),KEY(X+700,Y+H-60),KEY(X+400,Y+30)],
+            portals=[PORTAL(X+80,Y+H-80,X+W2-140,Y+20, vax=2.6,vay=2.6,vbx=-2.6,vby=2.6),
+                     PORTAL(X+80,Y+20,MX-22,MY-22, vax=3.9,vay=-1.3,vbx=-3.9,vby=1.3)]),
+
+        make_level("Level 30 — Gerbang Pertama",
+            "Pukul tombol → gerbang terbuka → dorong bola ke goal!",
+            (X+60, MY-15),(X+160, MY),(X+60, MY-210),
+            gates=[GATE_V(MX-9)],
+            buttons=[BTN(X+320, MY-17, 0)],
+            walls=[W(665,88,20,138), W(665,396,20,236), W(48,287,960,20), W(1068,287,184,20)]),
+
+        make_level("Level 31 — Dua Gerbang",
+            "Dua tombol di kiri → buka dua gerbang → dorong ke goal!",
+            (X+60, MY-15),(X+130, MY),(X+120, MY+180),
+            gates=[GATE_V(X+450-9), GATE_V(X+820-9)],
+            buttons=[BTN(X+280, Y+120, 0),
+                     BTN(X+680, Y+H-80, 1)],
+            walls=[W(645,88,20,203), W(645,441,20,191), W(48,472,442,20), W(750,472,502,20)]),
+
+        make_level("Level 32 — Dua Lapis Horizontal Zig-Zag",
+            "Pukul dua tombol di bawah → lewati labirin zig-zag → naikkan bola!",
+            (X+60, Y+H-50),(X+200, Y+H-80),(X+200, Y+20),
+            gates=[GATE_H(MY-9), GATE_H(Y+120)],
+            buttons=[BTN(X+450, Y+300, 0),
+                     BTN(X+700, Y+150, 1)],
+            walls=[
+
+                W(X, Y+H-150, W2-100, 20), 
+                
+                W(X+100, Y+H-220, W2-100, 20),
+                
+                W(X, Y+H-290, W2-100, 20),
+                
+                W(X+100, Y+H-360, W2-100, 20),
+                
+                W(X, Y+H-430, W2-100, 20)
+            ]),
+
+        make_level("Level 33 — Tiga Gerbang Berlabirin",
+            "Tiga gerbang! Selesaikan labirin rintangan dari kiri ke kanan.",
+            (X+60, Y+H-50),(X+160, Y+H-80),(X+50, Y+120),
+            gates=[GATE_V(X+510-9), GATE_V(X+750-9), GATE_H(MY-9)],
+            buttons=[BTN(X+420, Y+H-50, 0),
+                     BTN(X+620, Y+H-50, 1),
+                     BTN(X+1120, Y+H-50, 2)],
+            walls=[
+
+                W(1046,58,20,130), W(1046,398,20,234), 
+                W(48,299,408,20), W(X+1106,299,246,20),
+                
+                W(X+350, Y+330, 20, 230),
+                W(X+550, Y+330, 20, 230),
+                W(X+750, Y+310, 20, 210),
+                
+                W(X+150, Y+330, 200, 20),
+                W(X+450, Y+330, 150, 20),
+                W(X+650, Y+310, 150, 20),
+                
+                W(X+200, Y+150, 808, 20),
+                W(X+500, Y+220, 450, 20),
+                W(X+300, Y+40, 20, 180)
+            ]),
+
+        make_level("Level 34 — Gerbang Ganda Berlabirin",
+            "Tiga gerbang! Rantai tombol di bawah, navigasikan lewat labirin total.",
+            (X+60, Y+H-50),(X+160, Y+H-80),(X+250, Y+20),
+            gates=[GATE_V(X+540-9), GATE_V(X+890-9), GATE_H(MY-150)],
+            buttons=[BTN(X+200, Y+H-50, 0),
+                     BTN(X+720, Y+H-50, 1),
+                     BTN(X+1120, Y+250, 2)],
+            walls=[
+
+                W(X, Y+H-140, W2-200, 20),
+                W(X+W2-200, Y+H-240, 20, 60),
+                
+                W(X+150, Y+H-260, W2-150, 20),
+                W(X+150, Y+H-360, 20, 120),
+                
+                W(X, Y+280, 120, 20),
+                W(X+300, Y+200, W2-300, 20),
+                
+                W(X, Y+110, W2-150, 20),
+                W(X+W2-150, Y, 20, 60)
+            ]),
+
+        make_level("Level 35 — Empat Gerbang Rantai Zig-Zag",
+            "Rantai 4 gerbang! Navigasikan bola melewati labirin horizontal zig-zag.",
+            (X+60, Y+H-50),(X+140, Y+H-80),(X+40, Y+20),
+            gates=[GATE_V(X+390-9), GATE_H(MY-120),
+                   GATE_V(X+970-9), GATE_H(MY-220)],
+            buttons=[BTN(X+200,  Y+H-50, 0),
+                     BTN(X+1120,  Y+H-50, 1),
+                     BTN(X+200,  Y+200, 2),
+                     BTN(X+1120,  Y+100, 3)],
+            walls=[
+
+                W(X, Y+H-120, 900, 20),
+                
+                W(X+150, Y+H-210, W2-150, 20),
+                
+                W(X, Y+H-300, 900, 20),
+                
+                W(X+150, Y+H-390, W2-150, 20),
+                
+                W(X, Y+H-480, W2-150, 20),
+                
+                W(X+1150, Y+80, 150, 20)
+            ]),
+
+        make_level("Level 36 — Labirin Magnetik Zig-Zag",
+            "Magnet mengganggu di sela zig-zag! Selesaikan rantai 4 tombol.",
+            (X+60, Y+H-50),(X+160, Y+H-80),(X+W2-GOAL_W-20, Y+480),
+
+            magnet_zones=[
+
+                MZ(X+250, Y+H-130, 150, 280, 3.5),   
+                MZ(X+600, Y+H-130, 150, 280, -3.0),  
+                
+                MZ(X+50,  Y+H-280, 120, 280, 2.75),  
+                MZ(W2-150, Y+H-370, 120, 280, -2.75), 
+                
+                MZ(X+400, Y+140, 200, 270, 3.2)
+            ],
+            gates=[GATE_V(X+1100-9), GATE_H(Y+50-9),
+                   GATE_H(MY-9),    GATE_H(Y+120)],
+            buttons=[BTN(X+100,  Y+30, 0),
+                     BTN(X+900,  Y+100, 1),
+                     BTN(X+900,  Y+300, 2),
+                     BTN(X+100,  Y+200, 3)],
+            walls=[
+
+                W(X, Y+H-140, W2-180, 20),
+                
+                W(X+180, Y+H-230, W2-180, 20),
+                
+                W(X, Y+H-320, W2-180, 20),
+                
+                W(X+180, Y+H-410, W2-180, 20),
+                
+                W(X, Y+80, W2-180, 20)
+            ]),
+
+        make_level("Level 37 — Labirin Badai Berkerikil",
+            "Kombinasi angin, magnet, dan 5 gerbang dalam labirin zig-zag!",
+            (X+60, Y+H-50),(X+160, Y+H-80),(X+30, Y+20),
+
+            magnet_zones=[
+                MZ(X+400, Y+H-130, 200, 370, 3.5),
+                MZ(X+800, Y+H-130, 150, 370, -3.0),
+                MZ(X+100, Y+H-290, 150, 380, 2.8),
+                MZ(W2-250, Y+H-370, 180, 380, -2.5)
+            ],
+
+            winds=[
+                WIND(1.2, 0.0, 0.182),
+                WIND(0.0, 1.5, 0.117)
+            ],
+            gates=[GATE_V(X+490-9), GATE_V(X+650-9), GATE_V(X+820-9),
+                   GATE_H(MY-9),    GATE_H(Y+140)],
+            buttons=[BTN(X+300,  Y+H-50, 0),
+                     BTN(X+560,  Y+H-50, 1),
+                     BTN(X+720,  Y+H-50, 2),
+                     BTN(X+840,  Y+H-50, 3),
+                     BTN(X+990,  Y+H-50, 4)],
+            walls=[
+
+                W(X, Y+H-140, W2-150, 20),
+                
+                W(X+150, Y+H-220, W2-150, 20),
+                
+                W(X, Y+H-300, W2-150, 20),
+                
+                W(X+150, Y+H-380, W2-150, 20),
+                
+                W(X, Y+H-460, W2-150, 20)
+            ]),
+
+        make_level("Level 38 — Gerbang Penuh Jebakan",
+            "Lubang + angin + magnet + 5 gerbang! Jangan jatuh ke lubang.",
+            (X+60, Y+H-50),(X+160, Y+H-80),(X+W2-GOAL_W-20, Y+20),
+            walls=[W(349,88,20,288), W(349,506,20,126), W(48,425,187,20), W(455,425,797,20)]),
+
+        make_level("Level 39 — Gerbang + Kunci",
+            "Ambil 3 kunci DAN buka 6 gerbang untuk aktifkan goal!",
+            (X+60, Y+H-50),(X+160, Y+H-80),(X+W2-GOAL_W-20, Y+20),
+            gates=[GATE_V(X+350-9), GATE_V(X+520-9),
+                   GATE_V(X+700-9), GATE_V(X+860-9),
+                   GATE_H(MY-9),    GATE_H(Y+120)],
+            buttons=[BTN(X+200,  Y+H-50, 0),
+                     BTN(X+430,  Y+H-50, 1),
+                     BTN(X+600,  Y+H-50, 2),
+                     BTN(X+770,  Y+H-50, 3),
+                     BTN(X+880,  Y+H-50, 4),
+                     BTN(X+1020, Y+H-50, 5)],
+            keys=[KEY(X+100,MY-14),
+                  KEY(X+100,Y+30),
+                  KEY(X+100,Y+H-60)],
+            walls=[W(411,88,20,172), W(411,430,20,202), W(48,215,690,20), W(998,215,254,20)]),
+
+        make_level("Level 40 — KEKACAUAN MUTLAK",
+            "FINAL! 4 kunci + 2 portal bergerak + 6 gerbang + semua rintangan!",
+            (X+60, Y+H-50),(X+160, Y+H-80),(X+W2-GOAL_W-20, Y+20),
+            magnet_zones=[MZ(X+480,MY+20,240,110,3.5),MZ(X+730,MY+20,240,110,-3.12),
+                          MZ(X+980,MY+20,200,110,2.75),MZ(X+200,MY+20,200,90,3.0),
+                          MZ(MX-80,Y+30,240,90,-2.75),MZ(X+W2-250,Y+30,200,90,2.5)],
+            winds=[WIND(1.0,0.0,0.169),WIND(0.0,1.0,0.117),WIND(-1.0,0.0,0.091)],
+            holes=[HOLE(X+520,Y+H-90,70,70),
+                   HOLE(X+700,Y+H-90,70,70),
+                   HOLE(X+900,Y+H-90,70,70)],
+            gates=[GATE_V(X+470-9), GATE_V(X+600-9),
+                   GATE_V(X+780-9), GATE_V(X+900-9),
+                   GATE_H(MY-9),    GATE_H(Y+140)],
+            buttons=[BTN(X+200,  Y+H-50, 0),
+                     BTN(X+520,  Y+H-50, 1),
+                     BTN(X+680,  Y+H-50, 2),
+                     BTN(X+830,  Y+H-50, 3),
+                     BTN(X+940,  Y+H-50, 4),
+                     BTN(X+1080, Y+H-50, 5)],
+            keys=[KEY(X+100,MY-14),
+                  KEY(X+100,Y+30),
+                  KEY(X+100,Y+H-60),
+                  KEY(X+220,Y+30)],
+            portals=[PORTAL(X+80, Y+H-130, X+W2-140, Y+30,
+                            vax=2.6, vay=2.6, vbx=-3.9, vby=1.3),
+                     PORTAL(X+80, Y+30,    MX-22,    MY-22,
+                            vax=3.9, vay=-2.6, vbx=-2.6,   vby=3.9)],
+            walls=[W(1073,88,20,217), W(1073,435,20,197), W(48,299,903,20), W(1171,299,81,20)]),
+    ]
+
+LEVELS = make_levels()
+
+current_level = 0
+
+player          = None
+ball_pos        = [0.0,0.0]
+ball_vel        = [0.0,0.0]
+player_vel      = [0.0,0.0]
+win             = False
+goal            = None
+wind_particles  = []
+portal_floats   = {}
+
+keys_total      = 0
+keys_delivered  = 0
+gates_total     = 0
+gates_opened    = 0
+can_finish      = False
+carrying_key    = False
+current_key_obj = None
+
+GROWTH_LEVELS = 24
+
+def width_scale(idx):
+    if idx >= GROWTH_LEVELS - 1:
+        return 1.0
+    t = idx / (GROWTH_LEVELS - 1)
+    base   = 0.40 + 0.60 * t
+    wobble = 0.05 * math.sin(t * math.pi * 2.3)
+    return max(0.38, min(1.0, base + wobble))
+
+def height_scale(idx):
+
+    if idx >= GROWTH_LEVELS - 1:
+        return 1.0
+    t = idx / (GROWTH_LEVELS - 1)
+    base   = 0.82 + 0.18 * (t ** 0.6)
+    wobble = 0.03 * math.sin(t * math.pi * 1.7 + 1.1)
+    return max(0.80, min(1.0, base + wobble))
+
+def _scale_point(x, y, cx, cy, sx, sy):
+    return (cx + (x - cx) * sx, cy + (y - cy) * sy)
+
+def _place_rect_clip(r, cx, cy, sx, sy, arena):
+    nx, ny = _scale_point(r.x, r.y, cx, cy, sx, sy)
+    nr = pygame.Rect(round(nx), round(ny), r.w, r.h)
+    return nr.clip(arena)
+
+def _place_rect_clamp(r, cx, cy, sx, sy, arena):
+    nx, ny = _scale_point(r.x, r.y, cx, cy, sx, sy)
+    nr = pygame.Rect(round(nx), round(ny), r.w, r.h)
+    if nr.w >= arena.w or nr.h >= arena.h:
+        return nr.clip(arena)
+    if nr.left   < arena.left:   nr.x = arena.left
+    if nr.top    < arena.top:    nr.y = arena.top
+    if nr.right  > arena.right:  nr.x = arena.right  - nr.w
+    if nr.bottom > arena.bottom: nr.y = arena.bottom - nr.h
+    return nr
+
+def _place_point(x, y, w, h, cx, cy, sx, sy, arena, anchor="topleft"):
+    r = pygame.Rect(0, 0, w, h)
+    if anchor == "center":
+        r.center = (x, y)
+    else:
+        r.x, r.y = x, y
+    pr = _place_rect_clamp(r, cx, cy, sx, sy, arena)
+    return pr.center if anchor == "center" else (pr.x, pr.y)
+
+def build_scaled_level(raw, sx, sy, arena):
+    cx, cy = REF_ARENA.centerx, REF_ARENA.centery
+    d = {"name": raw["name"], "info": raw["info"], "friction": raw["friction"]}
+
+    d["player_start"] = _place_point(*raw["player_start"], PLAYER_SIZE, PLAYER_SIZE, cx, cy, sx, sy, arena)
+    d["ball_start"]   = _place_point(*raw["ball_start"], BALL_RADIUS*2, BALL_RADIUS*2, cx, cy, sx, sy, arena, anchor="center")
+    d["goal_pos"]     = _place_point(*raw["goal_pos"], GOAL_W, GOAL_H, cx, cy, sx, sy, arena)
+
+    d["walls"] = [_place_rect_clip(w, cx, cy, sx, sy, arena) for w in raw["walls"]]
+    d["holes"] = [_place_rect_clamp(h, cx, cy, sx, sy, arena) for h in raw["holes"]]
+    d["magnet_zones"] = [
+        {"rect": _place_rect_clamp(mz["rect"], cx, cy, sx, sy, arena), "force": mz["force"]}
+        for mz in raw["magnet_zones"]
+    ]
+    d["winds"] = [dict(w) for w in raw["winds"]]
+    d["keys"] = []
+    for k in raw["keys"]:
+        _kr = _place_rect_clamp(k["rect"], cx, cy, sx, sy, arena)
+        d["keys"].append({
+            "rect": _kr, "collected": False,
+            "vx": 0.0, "vy": 0.0, "portal_cd": 0,
+            "start_x": _kr.x, "start_y": _kr.y,
+        })
+
+    d["gates"] = []
+    for g in raw["gates"]:
+        r = _place_rect_clip(g["rect"], cx, cy, sx, sy, arena)
+        ng = {"type": g["type"], "open": False, "rect": r, "x": r.x, "y": r.y}
+        if g["type"] == "V":
+            ng["thickness"], ng["length"] = r.w, r.h
+        else:
+            ng["thickness"], ng["length"] = r.h, r.w
+        d["gates"].append(ng)
+
+    d["buttons"] = [
+        {"rect": _place_rect_clamp(b["rect"], cx, cy, sx, sy, arena), "gate_index": b["gate_index"], "active": False}
+        for b in raw["buttons"]
+    ]
+
+    d["portals"] = []
+    for p in raw["portals"]:
+        d["portals"].append({
+            "a": _place_rect_clamp(p["a"], cx, cy, sx, sy, arena), "b": _place_rect_clamp(p["b"], cx, cy, sx, sy, arena),
+            "va": [p["va"][0] * sx, p["va"][1] * sy], "vb": [p["vb"][0] * sx, p["vb"][1] * sy],
+            "cooldown": 0, "player_cooldown": 0, "key_cd": 0,
+        })
+    return d
+
+def eval_can_finish(d):
+    global can_finish
+    has_keys  = keys_total > 0
+    has_gates = gates_total > 0
+    if not has_keys and not has_gates:
+        can_finish = True
+    elif has_keys and not has_gates:
+
+        can_finish = (keys_delivered >= keys_total)
+    elif has_gates and not has_keys:
+
+        can_finish = (gates_opened >= gates_total)
+    else:
+
+        can_finish = (gates_opened >= gates_total) and (keys_delivered >= keys_total)
+
+CUR = None
+BOSS = None
+
+BOSS_INTRO_LINES = [
+    "??? : ...Begitu banyak yang mencoba. Begitu banyak yang gagal.",
+    "TANGAN RAKSASA : Kamu sudah sampai sejauh ini, si kecil berkunci.",
+    "TANGAN RAKSASA : Baiklah kalau begitu. Akan kubersihkan sendiri jalanmu.",
+    "TANGAN RAKSASA : Tapi ingat baik-baik — hanya GOAL yang boleh tersisa.",
+]
+BOSS_END_LINES = [
+    "TANGAN RAKSASA : ...Kau sampai ke goal. Sama seperti empat puluh yang lain sebelum kamu.",
+    "TANGAN RAKSASA : Tahukah kau kenapa arena ini selalu berubah bentuk setiap kali seseorang lolos?",
+    "TANGAN RAKSASA : Karena akulah yang membentuknya. Dinding, gerbang, lubang, angin — semua bagian dariku.",
+    "TANGAN RAKSASA : Dan kau baru saja melihatku membongkar semuanya sendiri, tanpa perlawanan sedikit pun.",
+    "TANGAN RAKSASA : Itu bukan hadiah untukmu. Itu ujian terakhir — apakah kau berhenti saat jalan sudah kosong.",
+    "TANGAN RAKSASA : Tapi kau tidak berhenti. Kau tetap mendorong bola itu, walau tak ada lagi yang menghalangi.",
+    "TANGAN RAKSASA : Itulah yang selama ini kucari. Bukan pemecah teka-teki — tapi pendorong yang tak pernah berhenti mendorong.",
+    "TANGAN RAKSASA : Sayangnya, si kecil berkunci... hanya satu yang boleh melihat apa yang ada di balik semua ini.",
+    "* Tangan raksasa itu perlahan mengangkat satu jarinya. Cahaya hijau mulai berkumpul di ujungnya. *",
+    "PLAYER : ......",
+    "TANGAN RAKSASA : Terima kasih sudah bermain sejauh ini. Sungguh.",
+    "TANGAN RAKSASA : Selamat tidur, si kecil berkunci.",
+    "* Cahaya hijau menyambar. Arena hening. Hanya GOAL yang tersisa, menyala sendirian dalam gelap. *",
+    "— TAMAT —",
+]
+BOSS_DESTROY_ORDER = ["magnet_zones","holes","portals","keys","gates","walls","winds"]
+BOSS_CHARGE_TICKS  = 55
+BOSS_PAUSE_TICKS   = 22
+BOSS_KILL_TICKS    = 70
+BOSS_MIN_READ_TICKS = 40
+BOSS_READ_TICKS_PER_CHAR = 1.5
+BOSS_MAX_READ_TICKS = 220
+
+def _boss_targets_for_category(d, cat):
+    if cat=="magnet_zones": return [z["rect"].center for z in d["magnet_zones"]]
+    if cat=="holes":        return [h.center for h in d["holes"]]
+    if cat=="portals":      return [p["a"].center for p in d["portals"]] + [p["b"].center for p in d["portals"]]
+    if cat=="keys":         return [k["rect"].center for k in d["keys"] if not k["collected"]]
+    if cat=="gates":        return [g["rect"].center for g in d["gates"] if not g["open"]]
+    if cat=="walls":        return [w.center for w in d["walls"]]
+    if cat=="winds":        return [(ARENA.centerx,ARENA.centery)] if d["winds"] else []
+    return []
+
+def _boss_min_read_ticks(text):
+    return max(BOSS_MIN_READ_TICKS, min(BOSS_MAX_READ_TICKS, int(len(text)*BOSS_READ_TICKS_PER_CHAR)+25))
+
+def init_boss():
+    global BOSS
+    order=[c for c in BOSS_DESTROY_ORDER if _boss_targets_for_category(CUR,c)]
+    BOSS = {
+        "phase":"intro","dialogue_i":0,"lines":BOSS_INTRO_LINES,"line_timer":0,
+        "cat_i":0,"order":order,"timer":0,
+        "hand_pos":(ARENA.centerx, ARENA.top-70),
+        "laser_target":None,"laser_on":False,
+        "end_i":0,"kill_timer":0,
+    }
+
+def boss_clear_category(cat):
+    global keys_total,gates_total,gates_opened,carrying_key,current_key_obj
+    d=CUR
+    if cat=="magnet_zones": d["magnet_zones"]=[]
+    elif cat=="holes":      d["holes"]=[]
+    elif cat=="portals":    d["portals"]=[]
+    elif cat=="keys":
+        d["keys"]=[]; keys_total=0; carrying_key=False; current_key_obj=None
+    elif cat=="gates":
+        for g in d["gates"]: g["open"]=True
+        gates_total=0; gates_opened=0
+    elif cat=="walls":      d["walls"]=[]
+    elif cat=="winds":      d["winds"]=[]
+    eval_can_finish(d)
+
+def boss_tick(tick):
+    if BOSS is None: return False
+    ph=BOSS["phase"]
+    if ph in ("intro","end"):
+        BOSS["line_timer"]=BOSS.get("line_timer",0)+1
+        return True
+    if ph=="destroy":
+        BOSS["timer"]+=1
+        cat=BOSS["order"][BOSS["cat_i"]]
+        pts=_boss_targets_for_category(CUR,cat)
+        if BOSS["timer"]<BOSS_CHARGE_TICKS:
+            BOSS["laser_on"]=True
+            if pts:
+                idxp=min(len(pts)-1,int(BOSS["timer"]/max(1,BOSS_CHARGE_TICKS)*len(pts)))
+                BOSS["laser_target"]=pts[idxp]
+        elif BOSS["timer"]==BOSS_CHARGE_TICKS:
+            boss_clear_category(cat)
+            BOSS["laser_on"]=False
+        elif BOSS["timer"]>=BOSS_CHARGE_TICKS+BOSS_PAUSE_TICKS:
+            BOSS["cat_i"]+=1; BOSS["timer"]=0
+            if BOSS["cat_i"]>=len(BOSS["order"]):
+                BOSS["phase"]="wait"
+        return True
+    if ph=="wait":
+        return False
+    if ph=="kill":
+        BOSS["kill_timer"]+=1
+        BOSS["laser_on"]=True
+        BOSS["laser_target"]=(player.centerx,player.centery)
+        if BOSS["kill_timer"]>=BOSS_KILL_TICKS:
+            BOSS["phase"]="end"; BOSS["lines"]=BOSS_END_LINES; BOSS["end_i"]=0; BOSS["line_timer"]=0
+            BOSS["laser_on"]=False
+        return True
+    return True
+
+def draw_boss(tick):
+    if BOSS is None: return
+    hx,hy=BOSS["hand_pos"]
+    pulse=int(abs(math.sin(tick*0.08))*8)
+    pygame.draw.circle(screen,(40,40,55),(hx,hy),46+pulse)
+    pygame.draw.circle(screen,(90,90,110),(hx,hy),46+pulse,3)
+    for fx in (-30,-10,10,30):
+        pygame.draw.rect(screen,(70,70,90),(hx+fx-8,hy-70,16,50),border_radius=6)
+        pygame.draw.rect(screen,(140,140,160),(hx+fx-8,hy-70,16,50),2,border_radius=6)
+    pygame.draw.rect(screen,(80,80,100),(hx-34,hy-30,68,46),border_radius=10)
+    pygame.draw.rect(screen,(150,150,170),(hx-34,hy-30,68,46),2,border_radius=10)
+    lbl=render_text(font_small,"TANGAN RAKSASA",(200,200,220))
+    screen.blit(lbl,(hx-lbl.get_width()//2,hy-96))
+
+    if BOSS.get("laser_on") and BOSS.get("laser_target"):
+        tx,ty=BOSS["laser_target"]
+        glow=int(3+abs(math.sin(tick*0.4))*4)
+        pygame.draw.line(screen,(10,80,20),(hx,hy),(tx,ty),12+glow)
+        pygame.draw.line(screen,(60,255,120),(hx,hy),(tx,ty),5+glow//2)
+        pygame.draw.line(screen,(220,255,220),(hx,hy),(tx,ty),2)
+        pygame.draw.circle(screen,(120,255,160),(int(tx),int(ty)),8+glow)
+
+def draw_boss_dialogue():
+    if BOSS is None: return
+    ph=BOSS["phase"]
+    if ph not in ("intro","end"): return
+    idx = BOSS["dialogue_i"] if ph=="intro" else BOSS["end_i"]
+    lines = BOSS["lines"]
+    if idx>=len(lines): return
+    box=pygame.Rect(WIDTH//2-460,HEIGHT-160,920,130)
+    s=pygame.Surface((box.w,box.h),pygame.SRCALPHA)
+    s.fill((10,15,15,225)); screen.blit(s,(box.x,box.y))
+    pygame.draw.rect(screen,(60,255,140),box,2)
+    txt=lines[idx]
+    t=font_med.render(txt,True,WHITE)
+    if t.get_width()>box.w-40:
+        t=font_small.render(txt,True,WHITE)
+    screen.blit(t,(box.x+20,box.y+26))
+
+    min_ticks=_boss_min_read_ticks(txt)
+    elapsed=BOSS.get("line_timer",0)
+    bar_w=box.w-40
+    fill_w=int(bar_w*clamp(elapsed/min_ticks,0.0,1.0))
+    bar_rect=pygame.Rect(box.x+20,box.y+box.h-46,bar_w,6)
+    pygame.draw.rect(screen,(50,60,55),bar_rect)
+    pygame.draw.rect(screen,(80,255,150) if elapsed>=min_ticks else (200,170,60),(bar_rect.x,bar_rect.y,fill_w,bar_rect.h))
+
+    if elapsed>=min_ticks:
+        hint=render_text(font_small,"Klik / SPASI / ENTER untuk lanjut...",(120,200,150))
+    else:
+        hint=render_text(font_small,"...",(150,150,120))
+    screen.blit(hint,(box.x+20,box.y+box.h-26))
+
+def boss_advance_click():
+    if BOSS is None: return
+    ph=BOSS["phase"]
+    if ph not in ("intro","end"): return
+    idx = BOSS["dialogue_i"] if ph=="intro" else BOSS["end_i"]
+    lines = BOSS["lines"]
+    if idx>=len(lines): return
+    if BOSS.get("line_timer",0) < _boss_min_read_ticks(lines[idx]):
+        return
+    if ph=="intro":
+        BOSS["dialogue_i"]+=1; BOSS["line_timer"]=0
+        if BOSS["dialogue_i"]>=len(BOSS["lines"]):
+            BOSS["phase"]="destroy"; BOSS["cat_i"]=0; BOSS["timer"]=0
+    elif ph=="end":
+        BOSS["end_i"]+=1; BOSS["line_timer"]=0
+
+def load_level(idx):
+    global player,ball_pos,ball_vel,player_vel,win,goal,wind_particles
+    global keys_total,keys_delivered,gates_total,gates_opened,can_finish
+    global carrying_key,current_key_obj
+    global ARENA,PLAYER_SIZE,BALL_RADIUS,GOAL_W,GOAL_H,CUR
+    global ball_portal_cd,player_portal_cd
+    global BOSS
+
+    sx,sy = width_scale(idx), height_scale(idx)
+    cx,cy = REF_ARENA.centerx, REF_ARENA.centery
+    ARENA = pygame.Rect(0,0, max(1,round(REF_ARENA.w*sx)), max(1,round(REF_ARENA.h*sy)))
+    ARENA.center = (cx,cy)
+
+    PLAYER_SIZE = REF_PLAYER_SIZE
+    BALL_RADIUS = REF_BALL_RADIUS
+    GOAL_W      = REF_GOAL_W
+    GOAL_H      = REF_GOAL_H
+
+    d   = build_scaled_level(LEVELS[idx], sx, sy, ARENA)
+    CUR = d
+
+    player     = pygame.Rect(int(d["player_start"][0]),int(d["player_start"][1]), PLAYER_SIZE, PLAYER_SIZE)
+    ball_pos   = [d["ball_start"][0], d["ball_start"][1]]
+    ball_vel   = [0.0,0.0]
+    player_vel = [0.0,0.0]
+    win        = False
+    goal       = pygame.Rect(int(d["goal_pos"][0]),int(d["goal_pos"][1]), GOAL_W, GOAL_H)
+    wind_particles = []
+
+    keys_total      = len(d["keys"])
+    keys_delivered  = 0
+    carrying_key    = False
+    current_key_obj = None
+
+    gates_total  = len(d["gates"])
+    gates_opened = 0
+
+    ball_portal_cd   = 0
+    player_portal_cd = 0
+
+    portal_floats.clear()
+
+    eval_can_finish(d)
+
+    if idx==39:
+        init_boss()
+    else:
+        BOSS=None
+
+load_level(0)
+
+joystick_active = False
+joystick_origin = (0,0)
+joystick_dx = joystick_dy = 0.0
+JOYSTICK_BASE_R = 60
+JOYSTICK_KNOB_R = 28
+
+def spawn_wind_particle(wind):
+    Xa,Ya,W2a,Ha = ARENA.x,ARENA.y,ARENA.w,ARENA.h
+    x = Xa+random.randint(0,W2a//3)     if wind["dx"]>0 else \
+        Xa+random.randint(W2a*2//3,W2a) if wind["dx"]<0 else \
+        Xa+random.randint(0,W2a)
+    y = Ya+random.randint(0,Ha//3)      if wind["dy"]>0 else \
+        Ya+random.randint(Ha*2//3,Ha)   if wind["dy"]<0 else \
+        Ya+random.randint(0,Ha)
+    sp = random.uniform(2.5,5.0)
+    hue = int((math.atan2(wind["dy"],wind["dx"])+math.pi)/(2*math.pi)*6)
+    cols = [(180,220,255),(180,255,200),(255,220,160),(255,180,180),(220,180,255),(160,220,255)]
+    wind_particles.append({
+        "x":float(x),"y":float(y),
+        "vx":wind["dx"]*sp,"vy":wind["dy"]*sp,
+        "life":random.randint(35,75),"max_life":75,
+        "length":random.randint(14,26),
+        "bc":cols[hue%6]
+    })
+
+def update_draw_wind(wind):
+    if random.random()<0.25: spawn_wind_particle(wind)
+
+def flush_wind_particles():
+    dead=[]
+    for wp in wind_particles:
+        wp["x"]+=wp["vx"]; wp["y"]+=wp["vy"]; wp["life"]-=1
+        a=wp["life"]/wp["max_life"]
+        bc=wp.get("bc",WIND_COLOR)
+        col=(int(bc[0]*a),int(bc[1]*a),int(bc[2]*a))
+        sl=max(abs(wp["vx"]),abs(wp["vy"]),1)
+        ex=wp["x"]-wp["vx"]*(wp["length"]/sl)
+        ey=wp["y"]-wp["vy"]*(wp["length"]/sl)
+        pygame.draw.line(screen,col,(int(ex),int(ey)),(int(wp["x"]),int(wp["y"])),2)
+        ang=math.atan2(wp["vy"],wp["vx"])
+        for da in(2.4,-2.4):
+            pygame.draw.line(screen,col,(int(wp["x"]),int(wp["y"])),
+                (int(wp["x"]-8*math.cos(ang+da)),int(wp["y"]-8*math.sin(ang+da))),2)
+        if wp["life"]<=0 or wp["x"]<ARENA.x or wp["x"]>ARENA.x+ARENA.w or \
+           wp["y"]<ARENA.y or wp["y"]>ARENA.y+ARENA.h:
+            dead.append(wp)
+    for dd in dead: wind_particles.remove(dd)
+
+def update_portals(d):
+    for p in d["portals"]:
+        pid = id(p)
+        if pid not in portal_floats:
+            portal_floats[pid] = {
+                "ax":float(p["a"].x),"ay":float(p["a"].y),
+                "bx":float(p["b"].x),"by":float(p["b"].y)
+            }
+        pf = portal_floats[pid]
+        s  = p["a"].w
+
+        for fk,vk,rk in [("ax","va","a"),("bx","vb","b")]:
+            fx,fy = fk, fk.replace("x","y")
+            vx,vy = p[vk][0], p[vk][1]
+
+            pf[fx] += vx; pf[fy] += vy
+
+            if pf[fx] < ARENA.left+2:
+                pf[fx]=ARENA.left+2; p[vk][0]=abs(p[vk][0])
+            if pf[fx]+s > ARENA.right-2:
+                pf[fx]=ARENA.right-2-s; p[vk][0]=-abs(p[vk][0])
+            if pf[fy] < ARENA.top+2:
+                pf[fy]=ARENA.top+2; p[vk][1]=abs(p[vk][1])
+            if pf[fy]+s > ARENA.bottom-2:
+                pf[fy]=ARENA.bottom-2-s; p[vk][1]=-abs(p[vk][1])
+
+            r_test = pygame.Rect(int(pf[fx]),int(pf[fy]),s,s)
+            for w in d["walls"]:
+                if r_test.colliderect(w):
+                    p[vk][0]=-p[vk][0]; p[vk][1]=-p[vk][1]
+                    pf[fx]-=vx*2; pf[fy]-=vy*2
+                    break
+
+            for g in d["gates"]:
+                if not g["open"]:
+                    r_test2=pygame.Rect(int(pf[fx]),int(pf[fy]),s,s)
+                    if r_test2.colliderect(g["rect"]):
+                        if g["type"]=="V": p[vk][0]=-p[vk][0]
+                        else:              p[vk][1]=-p[vk][1]
+                        pf[fx]-=vx; pf[fy]-=vy
+                        break
+
+            p[rk].x = int(pf[fx]); p[rk].y = int(pf[fy])
+
+def draw_grid():
+    for gx in range(0,WIDTH,30):
+        for gy in range(0,HEIGHT,30):
+            pygame.draw.rect(screen,(15,15,22),(gx,gy,1,1))
+
+def draw_arena():
+    pygame.draw.rect(screen,(18,18,28),ARENA)
+    pygame.draw.rect(screen,WHITE,ARENA,3)
+
+def draw_magnet_zones(zones,tick):
+    for z in zones:
+        col=(255,80,200) if z["force"]>0 else (80,200,255)
+        r=z["rect"]
+        pulse=int(12+abs(math.sin(tick*0.05))*18)
+        fill=(pulse,pulse//2,pulse) if z["force"]>0 else (0,pulse,pulse)
+        pygame.draw.rect(screen,fill,r)
+        pygame.draw.rect(screen,col,r,2)
+        screen.blit(render_text(font_small,"POSITIF" if z["force"]>0 else "NEGATIF",col),(r.x+6,r.y+4))
+
+def draw_holes(holes,tick):
+    for h in holes:
+        k=(h.x,h.y,h.w,h.h)
+        if k not in hole_surface_cache:
+            hole_surface_cache[k]=pygame.Surface((h.w,h.h),pygame.SRCALPHA)
+        surf=hole_surface_cache[k]
+        surf.fill((255,30,30,int(80+abs(math.sin(tick*0.07))*80)))
+        screen.blit(surf,(h.x,h.y))
+        pygame.draw.rect(screen,RED,h,3)
+        pygame.draw.line(screen,(180,0,0),(h.x,h.y),(h.x+h.w,h.y+h.h),2)
+        pygame.draw.line(screen,(180,0,0),(h.x+h.w,h.y),(h.x,h.y+h.h),2)
+
+_portal_surf_cache = {}
+def _get_portal_surf(w,h,col,alpha):
+    k=(w,h,col,alpha)
+    if k not in _portal_surf_cache:
+        s=pygame.Surface((w,h),pygame.SRCALPHA)
+        s.fill((*col,alpha))
+        _portal_surf_cache[k]=s
+    return _portal_surf_cache[k]
+
+def draw_portals(portals,tick):
+    pulse=int(abs(math.sin(tick*0.10))*60)
+    for portal in portals:
+        for rect,col,lbl in [(portal["a"],PURPLE,"IN"),(portal["b"],CYAN,"OUT")]:
+
+            pygame.draw.rect(screen,(col[0]//4,col[1]//4,col[2]//4),rect)
+            pygame.draw.rect(screen,col,rect,3)
+
+            glow_r=rect.w//2+4+pulse//12
+            pygame.draw.circle(screen,(*col,0),rect.center,glow_r,2)
+
+            t=render_text(font_small,lbl,col)
+            screen.blit(t,(rect.x+rect.w//2-t.get_width()//2,
+                           rect.y+rect.h//2-t.get_height()//2))
+
+def draw_walls(walls):
+    for w in walls:
+        pygame.draw.rect(screen,(90,90,110),w)
+        pygame.draw.rect(screen,(180,180,200),w,2)
+
+def draw_keys(d, tick):
+    for k in d["keys"]:
+        if not k["collected"]:
+            r=k["rect"]
+            pulse=int(20+abs(math.sin(tick*0.10))*15)
+
+            gs=pygame.Surface((r.w+pulse*2,r.h+pulse*2),pygame.SRCALPHA)
+            pygame.draw.ellipse(gs,(255,220,80,50),gs.get_rect())
+            screen.blit(gs,(r.x-pulse,r.y-pulse))
+            pygame.draw.rect(screen,YELLOW,r)
+            pygame.draw.rect(screen,WHITE,r,2)
+            t=render_text(font_small,"KEY",BLACK)
+            screen.blit(t,(r.x+r.w//2-t.get_width()//2,r.y+r.h//2-t.get_height()//2))
+
+def draw_gates_and_buttons(d, tick):
+    gates=d["gates"]; buttons=d["buttons"]
+
+    for btn in buttons:
+        gi=btn["gate_index"]
+        if gi>=len(gates): continue
+        g=gates[gi]
+        bx,by=btn["rect"].centerx,btn["rect"].centery
+        gx=g["x"]+g["thickness"]//2 if g["type"]=="V" else g["x"]+g["length"]//2
+        gy=g["y"]+g["length"]//2    if g["type"]=="V" else g["y"]+g["thickness"]//2
+        dx,dy=gx-bx,gy-by
+        dist=math.sqrt(dx*dx+dy*dy) or 1
+        steps=int(dist//12)
+        for i in range(steps):
+            t0=i/max(steps,1); t1=(i+0.6)/max(steps,1)
+            x0=int(bx+dx*t0); y0=int(by+dy*t0)
+            x1=int(bx+dx*t1); y1=int(by+dy*t1)
+            if btn["active"]:
+                phase=(tick*0.15-i*0.3)%(2*math.pi)
+                bright=int(160+95*math.sin(phase))
+                lc=(0,bright,int(bright*0.55))
+            else:
+                lc=(80,40,10)
+            pygame.draw.line(screen,lc,(x0,y0),(x1,y1),2)
+
+    for g in gates:
+        r=g["rect"]
+        if g["open"]:
+            s=pygame.Surface((r.w,r.h),pygame.SRCALPHA)
+            s.fill((0,200,80,20))
+            screen.blit(s,(r.x,r.y))
+            pygame.draw.rect(screen,(0,80,30),r,1)
+        else:
+            pulse=int(30+abs(math.sin(tick*0.06))*30)
+            pygame.draw.rect(screen,(pulse*3,pulse,0),r)
+            pygame.draw.rect(screen,GATE_CLOSED,r,3)
+            if g["type"]=="V":
+                for sy in range(r.y+4,r.y+r.h,20):
+                    pygame.draw.line(screen,(160,60,0),(r.x,sy),(r.x+r.w,min(sy+14,r.y+r.h)),2)
+            else:
+                for sx in range(r.x+4,r.x+r.w,20):
+                    pygame.draw.line(screen,(160,60,0),(sx,r.y),(min(sx+14,r.x+r.w),r.y+r.h),2)
+
+    for btn in buttons:
+        r=btn["rect"]
+        col=BTN_ON if btn["active"] else BTN_OFF
+        if not btn["active"]:
+            pulse=int(18+abs(math.sin(tick*0.09))*18)
+            gs=pygame.Surface((r.w+pulse*2,r.h+pulse*2),pygame.SRCALPHA)
+            pygame.draw.ellipse(gs,(255,60,60,40),gs.get_rect())
+            screen.blit(gs,(r.x-pulse,r.y-pulse))
+        pygame.draw.rect(screen,(col[0]//3,col[1]//3,col[2]//3),r)
+        pygame.draw.rect(screen,col,r,3)
+        cx,cy=r.centerx,r.centery
+        pygame.draw.circle(screen,col,(cx,cy),r.w//2-4)
+        pygame.draw.circle(screen,WHITE,(cx,cy),r.w//2-4,1)
+        if btn["active"]:
+            pygame.draw.line(screen,BLACK,(cx-5,cy),(cx-1,cy+5),3)
+            pygame.draw.line(screen,BLACK,(cx-1,cy+5),(cx+6,cy-5),3)
+        else:
+            lb=render_text(font_small,"!",WHITE)
+            screen.blit(lb,(cx-lb.get_width()//2,cy-lb.get_height()//2))
+
+def draw_goal_obj(goal, d, tick):
+    if can_finish:
+
+        pulse=int(60+abs(math.sin(tick*0.10))*60)
+        col=(0,200+pulse//3,80)
+        s=pygame.Surface((GOAL_W,GOAL_H),pygame.SRCALPHA)
+        s.fill((*col,80)); screen.blit(s,(goal.x,goal.y))
+        pygame.draw.rect(screen,col,goal,3)
+        for cx2,cy2 in [(goal.x+4,goal.y+4),(goal.x+GOAL_W-4,goal.y+4),
+                        (goal.x+4,goal.y+GOAL_H-4),(goal.x+GOAL_W-4,goal.y+GOAL_H-4)]:
+            pygame.draw.circle(screen,(100,255,180),(cx2,cy2),
+                               int(3+abs(math.sin(tick*0.18+cx2))*4))
+        t=render_text(font_small,"GOAL",(100,255,160))
+        screen.blit(t,(goal.x+GOAL_W//2-t.get_width()//2,goal.y+GOAL_H//2-t.get_height()//2))
+    elif carrying_key:
+
+        pulse=int(50+abs(math.sin(tick*0.14))*50)
+        col=(pulse*2, pulse*2, 0)
+        s=pygame.Surface((GOAL_W+pulse//2,GOAL_H+pulse//2),pygame.SRCALPHA)
+        s.fill((*col,50)); screen.blit(s,(goal.x-pulse//4,goal.y-pulse//4))
+        pygame.draw.rect(screen,(200,180,0),goal,3)
+        t=render_text(font_small,"ANTAR!",(220,200,0))
+        screen.blit(t,(goal.x+GOAL_W//2-t.get_width()//2,goal.y+GOAL_H//2-t.get_height()//2))
+
+        gcx,gcy=goal.centerx,goal.centery
+        for ang in (0,90,180,270):
+            rad=math.radians(ang)
+            ax=gcx+int(math.cos(rad)*(GOAL_W//2+8+pulse//6))
+            ay=gcy+int(math.sin(rad)*(GOAL_H//2+8+pulse//6))
+            pygame.draw.circle(screen,(220,200,0),(ax,ay),3)
+        return
+    else:
+
+        if gates_total > 0:
+            prog = gates_opened/gates_total
+        elif keys_total > 0:
+            prog = keys_delivered/keys_total
+        else:
+            prog = 0.0
+        bright=int(30+prog*80)
+        col=(bright*2,bright//2,0)
+        s=pygame.Surface((GOAL_W,GOAL_H),pygame.SRCALPHA)
+        s.fill((*col,25)); screen.blit(s,(goal.x,goal.y))
+        pygame.draw.rect(screen,(80,30,0),goal,2)
+        pygame.draw.line(screen,(80,30,0),(goal.x+8,goal.y+8),(goal.x+GOAL_W-8,goal.y+GOAL_H-8),2)
+        pygame.draw.line(screen,(80,30,0),(goal.x+GOAL_W-8,goal.y+8),(goal.x+8,goal.y+GOAL_H-8),2)
+        if gates_total > 0:
+            lbl=render_text(font_small,f"{gates_opened}/{gates_total}",(120,50,0))
+        else:
+            lbl=render_text(font_small,f"{keys_delivered}/{keys_total}",(120,100,0))
+        screen.blit(lbl,(goal.x+GOAL_W//2-lbl.get_width()//2,goal.y+GOAL_H//2-lbl.get_height()//2))
+
+    if d["gates"]:
+        gcx,gcy=goal.centerx,goal.centery
+        for g in d["gates"]:
+            ex=g["x"]+g["thickness"]//2 if g["type"]=="V" else g["x"]+min(80,g["length"]//2)
+            ey=g["y"]+min(80,g["length"]//2) if g["type"]=="V" else g["y"]+g["thickness"]//2
+            if g["open"]:
+                phase=tick*0.12
+                for i in range(20):
+                    t0=i/20; t1=(i+0.7)/20
+                    x0=int(ex+(gcx-ex)*t0); y0=int(ey+(gcy-ey)*t0)
+                    x1=int(ex+(gcx-ex)*t1); y1=int(ey+(gcy-ey)*t1)
+                    bright=int(120+135*abs(math.sin(phase-i*0.4)))
+                    pygame.draw.line(screen,(0,bright,bright//2),(x0,y0),(x1,y1),1)
+            else:
+                for i in range(0,16,2):
+                    t0=i/16; t1=(i+0.8)/16
+                    x0=int(ex+(gcx-ex)*t0); y0=int(ey+(gcy-ey)*t0)
+                    x1=int(ex+(gcx-ex)*t1); y1=int(ey+(gcy-ey)*t1)
+                    pygame.draw.line(screen,(50,25,5),(x0,y0),(x1,y1),1)
+
+def draw_ball():
+    bx,by=int(ball_pos[0]),int(ball_pos[1])
+    pygame.draw.circle(screen,GRAY_MID,(bx,by),BALL_RADIUS)
+    pygame.draw.circle(screen,WHITE,(bx,by),BALL_RADIUS,2)
+
+def draw_player(tick=0):
+    if carrying_key:
+
+        pygame.draw.rect(screen,ORANGE,player)
+        pygame.draw.rect(screen,WHITE,player,2)
+
+        pulse=int(3*math.sin(tick*0.15))
+        ix=player.centerx; iy=player.y-16+pulse
+        icon=pygame.Rect(0,0,16,16); icon.center=(ix,iy)
+        pygame.draw.rect(screen,YELLOW,icon)
+        pygame.draw.rect(screen,BLACK,icon,1)
+        pygame.draw.circle(screen,BLACK,(icon.centerx,icon.y-3),3,1)
+    else:
+        pygame.draw.rect(screen,YELLOW,player)
+        pygame.draw.rect(screen,WHITE,player,2)
+
+def draw_joystick():
+    if not joystick_active:
+        t=render_text(font_small,"Click+Drag / WASD / Arrow keys",(70,70,80))
+        screen.blit(t,(WIDTH//2-t.get_width()//2,HEIGHT-22))
+        return
+    ox,oy=joystick_origin
+    base=pygame.Surface((JOYSTICK_BASE_R*2,JOYSTICK_BASE_R*2),pygame.SRCALPHA)
+    pygame.draw.circle(base,(255,255,255,22),(JOYSTICK_BASE_R,JOYSTICK_BASE_R),JOYSTICK_BASE_R)
+    pygame.draw.circle(base,(255,255,255,55),(JOYSTICK_BASE_R,JOYSTICK_BASE_R),JOYSTICK_BASE_R,2)
+    screen.blit(base,(ox-JOYSTICK_BASE_R,oy-JOYSTICK_BASE_R))
+    kx=int(ox+joystick_dx*JOYSTICK_BASE_R); ky=int(oy+joystick_dy*JOYSTICK_BASE_R)
+    pygame.draw.circle(screen,YELLOW_DARK,(kx,ky),JOYSTICK_KNOB_R)
+    pygame.draw.circle(screen,YELLOW,(kx-3,ky-3),JOYSTICK_KNOB_R-4)
+    pygame.draw.circle(screen,WHITE,(kx,ky),JOYSTICK_KNOB_R,2)
+
+def draw_hud(d, tick):
+    screen.blit(render_text(font_hud,d["name"],WHITE),(ARENA.x+6,ARENA.y-28))
+    t=render_text(font_small,d["info"],(120,120,140))
+    screen.blit(t,(ARENA.x+ARENA.w-t.get_width()-6,ARENA.y-20))
+    num=render_text(font_small,f"{current_level+1}/{len(LEVELS)}",(80,80,100))
+    screen.blit(num,(WIDTH-num.get_width()-10,10))
+    row=6
+
+    if keys_total>0:
+        remaining = keys_total - keys_delivered
+        if carrying_key:
+            ktext = f"KUNCI: {keys_delivered}/{keys_total}  [BAWA KE GOAL!]"
+            kcol  = ORANGE
+        elif keys_delivered >= keys_total:
+            ktext = f"KUNCI: {keys_delivered}/{keys_total}  SEMUA TERKUMPUL!"
+            kcol  = GREEN
+        else:
+            ktext = f"KUNCI: {keys_delivered}/{keys_total}  (sisa {remaining})"
+            kcol  = (220,200,60)
+        kc=render_text(font_small, ktext, kcol)
+        screen.blit(kc,(ARENA.x+6,ARENA.y+row)); row+=16
+
+    if gates_total>0:
+        all_open=gates_opened>=gates_total
+        gt=render_text(font_small,
+            f"GERBANG: {gates_opened}/{gates_total}  TOMBOL: {sum(1 for b in d['buttons'] if b['active'])}/{len(d['buttons'])}",
+            (80,255,140) if all_open else (255,140,0))
+        screen.blit(gt,(ARENA.x+6,ARENA.y+row)); row+=16
+
+    if keys_total>0 or gates_total>0:
+        if can_finish:
+            gs=render_text(font_small,"Goal AKTIF — dorong bola masuk!",GREEN)
+        else:
+            if gates_total>0 and gates_opened<gates_total:
+                gs=render_text(font_small,f"Goal TERKUNCI — buka semua gerbang!",(160,60,0))
+            elif keys_total>0 and keys_delivered<keys_total:
+                gs=render_text(font_small,f"Goal TERKUNCI — antar semua kunci ke goal!",(160,120,0))
+            else:
+                gs=render_text(font_small,"Goal TERKUNCI",(140,60,0))
+        screen.blit(gs,(ARENA.x+6,ARENA.y+row)); row+=16
+
+    wind=d.get("wind")
+    if wind:
+        dirs={(1,0):"→ KANAN",(-1,0):"← KIRI",(0,1):"↓ BAWAH",(0,-1):"↑ ATAS"}
+        label=dirs.get((int(wind["dx"]),int(wind["dy"])),"ANGIN")
+        screen.blit(render_text(font_small,f"ANGIN: {label}",WIND_COLOR),(ARENA.x+6,ARENA.y+row))
+
+def draw_win_screen():
+    overlay=pygame.Surface((WIDTH,HEIGHT),pygame.SRCALPHA)
+    overlay.fill((0,0,0,150)); screen.blit(overlay,(0,0))
+    if current_level>=len(LEVELS)-1:
+        msg="SEMUA 40 LEVEL SELESAI"; sub="LUAR BIASA! Tapi kamu belum siap untuk ini!"
+    else:
+        msg="LEVEL SELESAI!"; sub=f"Klik / ENTER untuk Level {current_level+2}"
+    t=font_big.render(msg,True,GREEN); screen.blit(t,(WIDTH//2-t.get_width()//2,HEIGHT//2-50))
+    s=font_med.render(sub,True,(200,200,200)); screen.blit(s,(WIDTH//2-s.get_width()//2,HEIGHT//2+20))
+
+def get_closed_gate_rects(d):
+    return [g["rect"] for g in d["gates"] if not g["open"]]
+
+def get_all_portal_endpoints(d):
+    eps = []
+    for portal in d["portals"]:
+        eps.append(portal["a"])
+        eps.append(portal["b"])
+    return eps
+
+GAME_STATE = "MENU"
+_slots = load_all_slots()
+active_slot = None
+slot_scroll = 0
+slot_drag_active = False
+slot_drag_start_pos = (0,0)
+slot_drag_scroll_start = 0
+slot_drag_moved = False
+
+MENU_PLAY_RECT = pygame.Rect(WIDTH//2-140,380,280,60)
+MENU_TUT_RECT  = pygame.Rect(WIDTH//2-140,460,280,60)
+TUT_BACK_RECT  = pygame.Rect(WIDTH//2-140,630,280,55)
+SLOT_BACK_RECT = pygame.Rect(30,20,140,40)
+ADD_SLOT_RECT  = pygame.Rect(WIDTH//2-160,HEIGHT-64,320,44)
+
+SLOT_ROW_H     = 100
+SLOT_VIEW_TOP  = 160
+SLOT_VIEW_BOT  = HEIGHT-90
+SLOT_PANEL_X   = WIDTH//2-470
+SLOT_PANEL_W   = 940
+
+def slot_max_scroll(n_slots):
+    content_h = n_slots*SLOT_ROW_H
+    view_h = SLOT_VIEW_BOT-SLOT_VIEW_TOP
+    return max(0, content_h-view_h)
+
+def slot_row_panel(i, scroll):
+    y = SLOT_VIEW_TOP + i*SLOT_ROW_H - scroll
+    return pygame.Rect(SLOT_PANEL_X, y, SLOT_PANEL_W, SLOT_ROW_H-14)
+
+def slot_row_widgets(panel, has_save):
+    main_btn = pygame.Rect(panel.right-260, panel.y+13, 235, panel.h-26)
+    side_btn = pygame.Rect(panel.right-410, panel.y+22, 130, panel.h-44)
+    return main_btn, side_btn
+
+def draw_button(rect,label,color=GREEN,font=None):
+    font = font or font_med
+    hover=rect.collidepoint(pygame.mouse.get_pos())
+    base=(color[0]//3,color[1]//3,color[2]//3)
+    pygame.draw.rect(screen,base,rect,border_radius=10)
+    pygame.draw.rect(screen,WHITE if hover else color,rect,3,border_radius=10)
+    t=font.render(label,True,WHITE)
+    screen.blit(t,(rect.centerx-t.get_width()//2,rect.centery-t.get_height()//2))
+
+def draw_menu(tick):
+    screen.fill(BLACK); draw_grid()
+    title=font_big.render("PUSH BALL TOUCH",True,YELLOW)
+    screen.blit(title,(WIDTH//2-title.get_width()//2,170+int(6*math.sin(tick*0.05))))
+    sub=font_med.render("Dorong. Selesaikan. Bertahan sampai Level 40.",True,GRAY_MID)
+    screen.blit(sub,(WIDTH//2-sub.get_width()//2,250))
+    draw_button(MENU_PLAY_RECT,"MAIN",GREEN)
+    draw_button(MENU_TUT_RECT,"PETUNJUK",CYAN)
+    foot=render_text(font_small,"ESC untuk keluar",GRAY_MID)
+    screen.blit(foot,(WIDTH//2-foot.get_width()//2,HEIGHT-40))
+
+def draw_slot_menu(slots, scroll):
+    screen.fill(BLACK); draw_grid()
+    title=font_big.render("PILIH DATA",True,WHITE)
+    screen.blit(title,(WIDTH//2-title.get_width()//2,100))
+    draw_button(SLOT_BACK_RECT,"KEMBALI",GRAY_MID,font_small)
+
+    clip=pygame.Rect(0,SLOT_VIEW_TOP-4,WIDTH,SLOT_VIEW_BOT-SLOT_VIEW_TOP+8)
+    prev_clip=screen.get_clip()
+    screen.set_clip(clip)
+    for i,save in enumerate(slots):
+        panel=slot_row_panel(i,scroll)
+        if panel.bottom<SLOT_VIEW_TOP or panel.top>SLOT_VIEW_BOT:
+            continue
+        main_btn,side_btn=slot_row_widgets(panel,bool(save))
+        pygame.draw.rect(screen,(20,20,30),panel,border_radius=10)
+        pygame.draw.rect(screen,(90,90,110) if not save else (0,150,90),panel,2,border_radius=10)
+        label=render_text(font_med,f"SLOT {i+1}",WHITE)
+        screen.blit(label,(panel.x+20,panel.y+10))
+        if save:
+            info=render_text(font_small,f"Progres: Level {save['level']+1} / {len(LEVELS)}",GRAY_LIGHT)
+            screen.blit(info,(panel.x+20,panel.y+38))
+            draw_button(main_btn,"LANJUTKAN",GREEN,font_small)
+            draw_button(side_btn,"HAPUS",(200,60,60),font_small)
+        else:
+            info=render_text(font_small,"Slot kosong",GRAY_MID)
+            screen.blit(info,(panel.x+20,panel.y+38))
+            draw_button(main_btn,"MULAI BARU",ORANGE,font_small)
+            if len(slots)>1:
+                draw_button(side_btn,"HAPUS SLOT",(160,80,40),font_small)
+    screen.set_clip(prev_clip)
+
+    max_s=slot_max_scroll(len(slots))
+    if max_s>0:
+        track=pygame.Rect(WIDTH//2+485,SLOT_VIEW_TOP,8,SLOT_VIEW_BOT-SLOT_VIEW_TOP)
+        pygame.draw.rect(screen,(40,40,50),track,border_radius=4)
+        view_h=SLOT_VIEW_BOT-SLOT_VIEW_TOP
+        content_h=len(slots)*SLOT_ROW_H
+        thumb_h=max(30,int(view_h*view_h/content_h))
+        thumb_y=track.y+int((view_h-thumb_h)*(scroll/max_s))
+        pygame.draw.rect(screen,(100,255,160),(track.x,thumb_y,track.w,thumb_h),border_radius=4)
+        hint=render_text(font_small,"Scroll mouse untuk lihat slot lain",GRAY_MID)
+        screen.blit(hint,(WIDTH//2-hint.get_width()//2,SLOT_VIEW_TOP-30))
+
+    draw_button(ADD_SLOT_RECT,"+ TAMBAH SLOT BARU",CYAN,font_small)
+
+
+def draw_tutorial():
+    screen.fill(BLACK); draw_grid()
+    title=font_big.render("PETUNJUK",True,CYAN)
+    screen.blit(title,(WIDTH//2-title.get_width()//2,50))
+    lines=[
+        "TUJUAN: Dorong BOLA menyentuh sisi GOAL untuk menyelesaikan level.",
+        "GERAK: WASD / Panah keyboard, atau klik+seret di layar (joystick).",
+        "KUNCI: Sentuh untuk membawanya, lalu antar ke GOAL sebelum goal aktif.",
+        "GERBANG: Pukul bola ke TOMBOL untuk membuka gerbang yang terkunci.",
+        "MAGNET: Zona ungu menarik, zona cyan menolak bola (dan kunci).",
+        "ANGIN: Mendorong bola terus-menerus ke arah tertentu.",
+        "LUBANG: Jangan sampai bola/kunci jatuh — akan kembali ke posisi awal.",
+        "PORTAL: Masuk dari satu ujung, keluar acak dari ujung portal lain.",
+        "Level 40 adalah PUNCAK permainan — bertahanlah sampai akhir.",
+    ]
+    y=140
+    for ln in lines:
+        t=font_small.render(ln,True,GRAY_LIGHT)
+        screen.blit(t,(WIDTH//2-460,y)); y+=34
+    draw_button(TUT_BACK_RECT,"KEMBALI",GRAY_MID)
+
+def event_xy(event):
+    if event.type in (pygame.FINGERDOWN,pygame.FINGERMOTION,pygame.FINGERUP):
+        return (event.x*WIDTH, event.y*HEIGHT)
+    return event.pos
+
+def slot_hit_test(pos):
+    if SLOT_BACK_RECT.collidepoint(pos):
+        return ("back",None)
+    if ADD_SLOT_RECT.collidepoint(pos):
+        return ("add",None)
+    for i,save in enumerate(_slots):
+        panel=slot_row_panel(i,slot_scroll)
+        if panel.bottom<SLOT_VIEW_TOP or panel.top>SLOT_VIEW_BOT:
+            continue
+        main_btn,side_btn=slot_row_widgets(panel,bool(save))
+        if save and side_btn.collidepoint(pos):
+            return ("reset",i)
+        if (not save) and len(_slots)>1 and side_btn.collidepoint(pos):
+            return ("remove",i)
+        if main_btn.collidepoint(pos):
+            return ("main",i)
+    return (None,None)
+
+tick=0; running=True
+
+while running:
+    tick+=1
+
+    for event in pygame.event.get():
+        if event.type==pygame.QUIT: running=False
+
+        if GAME_STATE=="MENU":
+            if event.type==pygame.KEYDOWN and event.key==pygame.K_ESCAPE: running=False
+            if event.type==pygame.MOUSEBUTTONDOWN:
+                if MENU_PLAY_RECT.collidepoint(event.pos):
+                    _slots=load_all_slots(); slot_scroll=0; GAME_STATE="SLOT"
+                elif MENU_TUT_RECT.collidepoint(event.pos):
+                    GAME_STATE="TUTORIAL"
+
+        elif GAME_STATE=="SLOT":
+            if event.type==pygame.KEYDOWN and event.key==pygame.K_ESCAPE: GAME_STATE="MENU"
+
+            if event.type==pygame.MOUSEWHEEL:
+                max_s=slot_max_scroll(len(_slots))
+                slot_scroll=clamp(slot_scroll-event.y*44,0,max_s)
+
+            if event.type==pygame.MOUSEBUTTONDOWN:
+                if event.button==4:
+                    max_s=slot_max_scroll(len(_slots)); slot_scroll=clamp(slot_scroll-44,0,max_s)
+                elif event.button==5:
+                    max_s=slot_max_scroll(len(_slots)); slot_scroll=clamp(slot_scroll+44,0,max_s)
+                else:
+                    pos=event_xy(event)
+                    slot_drag_active=True; slot_drag_start_pos=pos
+                    slot_drag_scroll_start=slot_scroll; slot_drag_moved=False
+
+            if event.type==pygame.MOUSEMOTION and slot_drag_active:
+                pos=event_xy(event)
+                dy=slot_drag_start_pos[1]-pos[1]
+                if abs(dy)>8:
+                    slot_drag_moved=True
+                    max_s=slot_max_scroll(len(_slots))
+                    slot_scroll=clamp(slot_drag_scroll_start+dy,0,max_s)
+
+            if event.type==pygame.MOUSEBUTTONUP:
+                if slot_drag_active and not slot_drag_moved:
+                    pos=event_xy(event)
+                    kind,i=slot_hit_test(pos)
+                    if kind=="back":
+                        GAME_STATE="MENU"
+                    elif kind=="add":
+                        add_slot(); _slots=load_all_slots()
+                        max_s=slot_max_scroll(len(_slots)); slot_scroll=max_s
+                    elif kind=="reset":
+                        reset_slot(i); _slots=load_all_slots()
+                    elif kind=="remove":
+                        remove_slot(i); _slots=load_all_slots()
+                        max_s=slot_max_scroll(len(_slots)); slot_scroll=clamp(slot_scroll,0,max_s)
+                    elif kind=="main":
+                        save=_slots[i]; active_slot=i
+                        if save:
+                            lvl=clamp(save["level"],0,len(LEVELS)-1)
+                            current_level=lvl; load_level(current_level)
+                        else:
+                            current_level=0; load_level(0)
+                            save_slot(active_slot,0,0)
+                        GAME_STATE="PLAYING"
+                slot_drag_active=False; slot_drag_moved=False
+
+        elif GAME_STATE=="TUTORIAL":
+            if event.type==pygame.KEYDOWN and event.key==pygame.K_ESCAPE: GAME_STATE="MENU"
+            if event.type==pygame.MOUSEBUTTONDOWN and TUT_BACK_RECT.collidepoint(event.pos):
+                GAME_STATE="MENU"
+
+        elif GAME_STATE=="PLAYING":
+            if event.type==pygame.KEYDOWN:
+                if event.key==pygame.K_ESCAPE: GAME_STATE="MENU"
+                if BOSS is not None and BOSS["phase"] in ("intro","end") and event.key in (pygame.K_RETURN,pygame.K_SPACE):
+                    boss_advance_click()
+                    if BOSS["phase"]=="end" and BOSS["end_i"]>=len(BOSS["lines"]):
+                        GAME_STATE="MENU"
+                elif win and BOSS is None and event.key in(pygame.K_RETURN,pygame.K_SPACE):
+                    if current_level<len(LEVELS)-1:
+                        current_level+=1; load_level(current_level)
+                        save_slot(active_slot,current_level,current_level)
+            if event.type==pygame.MOUSEBUTTONDOWN:
+                if BOSS is not None and BOSS["phase"] in ("intro","end"):
+                    boss_advance_click()
+                    if BOSS["phase"]=="end" and BOSS["end_i"]>=len(BOSS["lines"]):
+                        GAME_STATE="MENU"
+                elif win and BOSS is None:
+                    if current_level<len(LEVELS)-1:
+                        current_level+=1; load_level(current_level)
+                        save_slot(active_slot,current_level,current_level)
+                elif not win:
+                    joystick_active=True; joystick_origin=event.pos; joystick_dx=joystick_dy=0.0
+            if event.type==pygame.MOUSEBUTTONUP:
+                joystick_active=False; joystick_dx=joystick_dy=0.0
+            if event.type==pygame.MOUSEMOTION and joystick_active:
+                ox,oy=joystick_origin
+                dx=event.pos[0]-ox; dy=event.pos[1]-oy
+                dist=math.sqrt(dx*dx+dy*dy)
+                if dist>JOYSTICK_BASE_R: joystick_dx=dx/dist; joystick_dy=dy/dist
+                else: joystick_dx=dx/JOYSTICK_BASE_R; joystick_dy=dy/JOYSTICK_BASE_R
+
+    if GAME_STATE=="MENU":
+        draw_menu(tick); pygame.display.flip(); clock.tick(60); continue
+    if GAME_STATE=="SLOT":
+        draw_slot_menu(_slots, slot_scroll); pygame.display.flip(); clock.tick(60); continue
+    if GAME_STATE=="TUTORIAL":
+        draw_tutorial(); pygame.display.flip(); clock.tick(60); continue
+
+    screen.fill(BLACK)
+    draw_grid()
+    d=CUR
+
+    boss_frozen = boss_tick(tick) if BOSS is not None else False
+
+    if not boss_frozen:
+        update_portals(d)
+
+    if not win and not boss_frozen:
+
+        keys=pygame.key.get_pressed()
+        kb_dx=kb_dy=0
+        if keys[pygame.K_LEFT]  or keys[pygame.K_a]: kb_dx-=1
+        if keys[pygame.K_RIGHT] or keys[pygame.K_d]: kb_dx+=1
+        if keys[pygame.K_UP]    or keys[pygame.K_w]: kb_dy-=1
+        if keys[pygame.K_DOWN]  or keys[pygame.K_s]: kb_dy+=1
+        if kb_dx and kb_dy: kb_dx*=0.707; kb_dy*=0.707
+
+        player_vel[0]*=0.75; player_vel[1]*=0.75
+        mx=(joystick_dx if joystick_active else kb_dx)*PLAYER_SPEED+player_vel[0]
+        my=(joystick_dy if joystick_active else kb_dy)*PLAYER_SPEED+player_vel[1]
+
+        old_px,old_py=player.x,player.y
+        player.x+=int(mx); player.y+=int(my)
+        player.x=clamp(player.x,ARENA.x+2,ARENA.x+ARENA.w-PLAYER_SIZE-2)
+        player.y=clamp(player.y,ARENA.y+2,ARENA.y+ARENA.h-PLAYER_SIZE-2)
+
+        for w in d["walls"]:
+            if player.colliderect(w):
+                player.x,player.y=old_px,old_py
+                player.x+=int(mx); player.x=clamp(player.x,ARENA.x+2,ARENA.x+ARENA.w-PLAYER_SIZE-2)
+                if player.colliderect(w): player.x=old_px
+                player.y+=int(my); player.y=clamp(player.y,ARENA.y+2,ARENA.y+ARENA.h-PLAYER_SIZE-2)
+                if player.colliderect(w): player.y=old_py
+                player_vel[0]=0; player_vel[1]=0
+
+        for gr in get_closed_gate_rects(d):
+            if player.colliderect(gr):
+                player.x,player.y=old_px,old_py
+                player.x+=int(mx); player.x=clamp(player.x,ARENA.x+2,ARENA.x+ARENA.w-PLAYER_SIZE-2)
+                if player.colliderect(gr): player.x=old_px
+                player.y+=int(my); player.y=clamp(player.y,ARENA.y+2,ARENA.y+ARENA.h-PLAYER_SIZE-2)
+                if player.colliderect(gr): player.y=old_py
+                player_vel[0]=0; player_vel[1]=0
+
+        dpx=player.x-old_px; dpy=player.y-old_py
+
+        for wind in d["winds"]:
+            ball_vel[0]+=wind["dx"]*wind["strength"]
+            ball_vel[1]+=wind["dy"]*wind["strength"]
+
+        if rect_circle_collide(player.x,player.y,PLAYER_SIZE,PLAYER_SIZE,ball_pos[0],ball_pos[1],BALL_RADIUS):
+            nx,ny,overlap=resolve_rect_circle(player.x,player.y,PLAYER_SIZE,PLAYER_SIZE,ball_pos[0],ball_pos[1],BALL_RADIUS)
+            ball_pos[0]+=nx*(overlap+1); ball_pos[1]+=ny*(overlap+1)
+            push=math.sqrt(dpx*dpx+dpy*dpy)
+            ball_vel[0]=nx*(push*2.8+3.0); ball_vel[1]=ny*(push*2.8+3.0)
+
+        _closed_gates = get_closed_gate_rects(d)
+        _blockers = d["walls"] + _closed_gates
+        resolve_ball_against_blockers(ball_pos, ball_vel, _blockers)
+
+        ball_vel[0]*=d["friction"]; ball_vel[1]*=d["friction"]
+        _dist  = math.hypot(ball_vel[0], ball_vel[1])
+        _steps = min(60, max(1, int(_dist // 4) + 1))
+        _sx, _sy = ball_vel[0]/_steps, ball_vel[1]/_steps
+        for _step_i in range(_steps):
+            ball_pos[0]+=_sx; ball_pos[1]+=_sy
+            resolve_ball_against_blockers(ball_pos, ball_vel, _blockers)
+
+        for mz in d["magnet_zones"]:
+            r=mz["rect"]
+            if r.collidepoint(ball_pos[0],ball_pos[1]):
+                cx_m=r.x+r.w/2; cy_m=r.y+r.h/2
+                ddx=cx_m-ball_pos[0]; ddy=cy_m-ball_pos[1]
+                dist2=math.sqrt(ddx*ddx+ddy*ddy) or 1
+                ball_vel[0]+=(ddx/dist2)*mz["force"]*0.4
+                ball_vel[1]+=(ddy/dist2)*mz["force"]*0.4
+
+        for k in d["keys"]:
+            if k["collected"]: continue
+            kr=k["rect"]
+
+            for mz in d["magnet_zones"]:
+                r=mz["rect"]
+                if r.collidepoint(kr.centerx,kr.centery):
+                    cx_m=r.x+r.w/2; cy_m=r.y+r.h/2
+                    ddx=cx_m-kr.centerx; ddy=cy_m-kr.centery
+                    dist2=math.sqrt(ddx*ddx+ddy*ddy) or 1
+
+                    k.setdefault("vx",0.0); k.setdefault("vy",0.0)
+                    k["vx"]+=(ddx/dist2)*mz["force"]*0.15
+                    k["vy"]+=(ddy/dist2)*mz["force"]*0.15
+
+            for wind in d["winds"]:
+                k.setdefault("vx",0.0); k.setdefault("vy",0.0)
+                k["vx"]+=wind["dx"]*wind["strength"]*0.4
+                k["vy"]+=wind["dy"]*wind["strength"]*0.4
+
+            if "vx" in k:
+                k["vx"]*=0.85; k["vy"]*=0.85
+                _kclosed_gates = get_closed_gate_rects(d)
+                _kbounce = 0.45
+                _ksteps = min(20, max(1, int(math.hypot(k["vx"], k["vy"]) // 4) + 1))
+                for _ in range(_ksteps):
+                    _ksx, _ksy = k["vx"]/_ksteps, k["vy"]/_ksteps
+                    old_kx = kr.x
+                    kr.x = clamp(int(kr.x+_ksx),ARENA.x+4,ARENA.x+ARENA.w-kr.w-4)
+                    if any(kr.colliderect(w) for w in d["walls"]) or any(kr.colliderect(g) for g in _kclosed_gates):
+                        kr.x = old_kx
+                        k["vx"] = -k["vx"]*_kbounce
+                    old_ky = kr.y
+                    kr.y = clamp(int(kr.y+_ksy),ARENA.y+4,ARENA.y+ARENA.h-kr.h-4)
+                    if any(kr.colliderect(w) for w in d["walls"]) or any(kr.colliderect(g) for g in _kclosed_gates):
+                        kr.y = old_ky
+                        k["vy"] = -k["vy"]*_kbounce
+
+        _portal_eps_k = get_all_portal_endpoints(d)
+        for k in d["keys"]:
+            if k["collected"]: continue
+            cd=k.get("portal_cd",0)
+            if cd>0:
+                k["portal_cd"]=cd-1
+                continue
+            kr=k["rect"]
+            for i,ep in enumerate(_portal_eps_k):
+                if ep.colliderect(kr):
+                    others=[e for j,e in enumerate(_portal_eps_k) if j!=i]
+                    if others:
+                        target=random.choice(others)
+                        kr.centerx=target.centerx; kr.centery=target.centery
+                        kr.x=clamp(kr.x,ARENA.x+4,ARENA.x+ARENA.w-kr.w-4)
+                        kr.y=clamp(kr.y,ARENA.y+4,ARENA.y+ARENA.h-kr.h-4)
+                        k["portal_cd"]=40
+                    break
+
+        if carrying_key:
+            for mz in d["magnet_zones"]:
+                r=mz["rect"]
+                pcx=player.x+PLAYER_SIZE/2; pcy=player.y+PLAYER_SIZE/2
+                if r.collidepoint(pcx,pcy):
+                    cx_m=r.x+r.w/2; cy_m=r.y+r.h/2
+                    ddx=cx_m-pcx; ddy=cy_m-pcy
+                    dist2=math.sqrt(ddx*ddx+ddy*ddy) or 1
+
+                    player_vel[0]+=(ddx/dist2)*mz["force"]*0.18
+                    player_vel[1]+=(ddy/dist2)*mz["force"]*0.18
+            for wind in d["winds"]:
+                player_vel[0]+=wind["dx"]*wind["strength"]*3.5
+                player_vel[1]+=wind["dy"]*wind["strength"]*3.5
+
+        if ball_pos[0]-BALL_RADIUS<ARENA.x+2:
+            ball_pos[0]=ARENA.x+2+BALL_RADIUS; ball_vel[0]=abs(ball_vel[0])*BOUNCE
+        if ball_pos[0]+BALL_RADIUS>ARENA.x+ARENA.w-2:
+            ball_pos[0]=ARENA.x+ARENA.w-2-BALL_RADIUS; ball_vel[0]=-abs(ball_vel[0])*BOUNCE
+        if ball_pos[1]-BALL_RADIUS<ARENA.y+2:
+            ball_pos[1]=ARENA.y+2+BALL_RADIUS; ball_vel[1]=abs(ball_vel[1])*BOUNCE
+        if ball_pos[1]+BALL_RADIUS>ARENA.y+ARENA.h-2:
+            ball_pos[1]=ARENA.y+ARENA.h-2-BALL_RADIUS; ball_vel[1]=-abs(ball_vel[1])*BOUNCE
+
+        for h in d["holes"]:
+            if h.collidepoint(ball_pos[0],ball_pos[1]):
+                ball_pos=list(d["ball_start"]); ball_vel=[0.0,0.0]; break
+
+        for k in d["keys"]:
+            if k["collected"]:
+                continue
+            kr = k["rect"]
+            for h in d["holes"]:
+                if h.colliderect(kr):
+                    kr.x = k["start_x"]; kr.y = k["start_y"]
+                    k["vx"] = 0.0; k["vy"] = 0.0; k["portal_cd"] = 0
+                    break
+
+        if carrying_key:
+            for h in d["holes"]:
+                if h.colliderect(player):
+
+                    if current_key_obj is not None:
+                        current_key_obj["collected"] = False
+                        current_key_obj["rect"].x = current_key_obj["start_x"]
+                        current_key_obj["rect"].y = current_key_obj["start_y"]
+                        current_key_obj["vx"] = 0.0
+                        current_key_obj["vy"] = 0.0
+                        current_key_obj["portal_cd"] = 0
+                    carrying_key    = False
+                    current_key_obj = None
+                    break
+
+        for btn in d["buttons"]:
+            if not btn["active"]:
+                br=btn["rect"]
+                if rect_circle_collide(br.x,br.y,br.w,br.h,ball_pos[0],ball_pos[1],BALL_RADIUS):
+                    btn["active"]=True
+                    gi=btn["gate_index"]
+                    if gi<len(d["gates"]):
+                        d["gates"][gi]["open"]=True
+                        gates_opened+=1
+                    nx,ny,overlap=resolve_rect_circle(br.x,br.y,br.w,br.h,ball_pos[0],ball_pos[1],BALL_RADIUS)
+                    ball_pos[0]+=nx*(overlap+1); ball_pos[1]+=ny*(overlap+1)
+                    dot=ball_vel[0]*nx+ball_vel[1]*ny
+                    ball_vel[0]=(ball_vel[0]-2*dot*nx)*BOUNCE
+                    ball_vel[1]=(ball_vel[1]-2*dot*ny)*BOUNCE
+                    eval_can_finish(d)
+
+        _portal_eps = get_all_portal_endpoints(d)
+
+        if ball_portal_cd>0:
+            ball_portal_cd-=1
+        else:
+            for i,ep in enumerate(_portal_eps):
+                if ep.collidepoint(ball_pos[0],ball_pos[1]):
+                    others=[e for j,e in enumerate(_portal_eps) if j!=i]
+                    if others:
+                        target=random.choice(others)
+                        ball_pos[0]=target.centerx; ball_pos[1]=target.centery
+                        ball_portal_cd=60
+                    break
+
+        if player_portal_cd>0:
+            player_portal_cd-=1
+        else:
+            pcx,pcy=player.centerx,player.centery
+            for i,ep in enumerate(_portal_eps):
+                if ep.collidepoint(pcx,pcy):
+                    others=[e for j,e in enumerate(_portal_eps) if j!=i]
+                    if others:
+                        target=random.choice(others)
+                        player.centerx=target.centerx; player.centery=target.centery
+                        player.x=clamp(player.x,ARENA.x+2,ARENA.x+ARENA.w-PLAYER_SIZE-2)
+                        player.y=clamp(player.y,ARENA.y+2,ARENA.y+ARENA.h-PLAYER_SIZE-2)
+                        player_portal_cd=60
+                    break
+
+        if not carrying_key:
+            for k in d["keys"]:
+                if not k["collected"] and player.colliderect(k["rect"]):
+                    k["collected"] = True
+                    carrying_key    = True
+                    current_key_obj = k
+
+                    break
+
+        if carrying_key and player.colliderect(goal):
+            carrying_key    = False
+            current_key_obj = None
+            keys_delivered += 1
+            eval_can_finish(d)
+
+        if can_finish:
+            if (goal.x+6<ball_pos[0]<goal.x+GOAL_W-6 and
+                    goal.y+6<ball_pos[1]<goal.y+GOAL_H-6):
+                if not win:
+                    win=True
+                    if current_level>=len(LEVELS)-1:
+                        save_slot(active_slot,current_level,current_level)
+                    if BOSS is not None and BOSS["phase"]=="wait":
+                        BOSS["phase"]="kill"; BOSS["kill_timer"]=0
+
+    draw_arena()
+    for w in d["winds"]: update_draw_wind(w)
+    flush_wind_particles()
+    draw_magnet_zones(d["magnet_zones"],tick)
+    draw_holes(d["holes"],tick)
+    draw_portals(d["portals"],tick)
+    draw_walls(d["walls"])
+    draw_gates_and_buttons(d,tick)
+    draw_keys(d,tick)
+    draw_goal_obj(goal,d,tick)
+    draw_ball()
+    if not (BOSS is not None and BOSS["phase"] in ("kill","end") and (BOSS["phase"]=="end" or BOSS.get("kill_timer",0)>=BOSS_KILL_TICKS//2)):
+        draw_player(tick)
+    draw_joystick()
+    draw_hud(d,tick)
+    if BOSS is not None:
+        draw_boss(tick)
+        draw_boss_dialogue()
+    if win and BOSS is None:
+        draw_win_screen()
+    pygame.display.flip()
+    clock.tick(60)
+
+pygame.quit()
+sys.exit()
